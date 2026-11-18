@@ -4,7 +4,6 @@ Goal: show and control Spotify playing on **another** Spotify Connect device (e.
 
 ## Files
 
-- `auth.rs`: OAuth authorization code + PKCE with librespot's public desktop ("keymaster") client id `65b708073fc0480ea92a077233ca87bd`, redirect `http://127.0.0.1:8898/login`, scope `streaming`. No client secret, no password.
 - `connect.rs`: observer device registration, cluster to `Playback` mapping, command bodies. Pure and unit-tested.
 - `session.rs`: the live librespot `Session`: access point login, dealer, observer loop.
 - `mod.rs`: the UI contract (`SpotifyState`, `Playback`, `SpotifyCommand`, `start`, `send`) and persistence.
@@ -15,7 +14,7 @@ Goal: show and control Spotify playing on **another** Spotify Connect device (e.
 
 ## Flow
 
-1. **Sign in.** The app binds a one-shot listener on `127.0.0.1:8898` and opens Spotify's authorize page in an in-app auth session (NSH `open_auth_session`). Spotify redirects to the loopback URL; the listener checks `state`, and the app exchanges the code (+ PKCE verifier) for an access token.
+1. **Sign in (pairing).** librespot-oauth's `DeviceAuthClient` (OAuth device authorization, RFC 8628) with the Spotify for Desktop client id `65b708073fc0480ea92a077233ca87bd` and scope `streaming`. The iPad shows a short code; the user approves it at spotify.com/pair on a phone or computer while the app polls. No browser on the iPad and no local port (the in-app login page loaded blank on iPadOS 15).
 2. **Access point.** The token logs the `Session` in (`Session::connect`). The access point returns a reusable credential (`session.auth_data()`).
 3. **Persist.** Only the username, that stored credential (base64) and a random observer device id are stored in NSH app storage. Later launches log in with `AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS`. Sign out removes them.
 4. **Observe.** Dealer listeners are registered before the dealer starts. When the connection id arrives, the app registers a hidden, non-playing device (`is_active = false`, `can_be_player = false`, `hidden = true`) and follows `ClusterUpdate`s.
@@ -23,14 +22,14 @@ Goal: show and control Spotify playing on **another** Spotify Connect device (e.
 
 ## Runtime note
 
-librespot needs the tokio runtime context; NSH press handlers do not have it, and their owner is disposed when the screen changes. Sign-in and the session therefore run from detached engine tasks (`Owner::detached().run(|| spawn(..))`) that call `background(..)`.
+librespot needs the tokio runtime context; NSH press handlers do not have it, and their owner is disposed when the screen changes. Pairing and the session therefore run from detached engine tasks (`Owner::detached().run(|| spawn(..))`) that call `background(..)`.
 ## Debugging
 
 Hold the clock to open the debug log: every login step, errors (with librespot's error kind) and commands are listed there, newest first, with Copy.
 
 ## Not yet verified
 
-That the loopback sign-in completes inside the iPadOS 15 auth sheet; that a hidden non-player device receives cluster updates; that the player-command endpoint accepts commands from it. Failures show an error on the music card and in the debug log; it never shows made-up playback.
+That a hidden non-player device receives cluster updates; that the player-command endpoint accepts commands from it. Failures show an error on the music card and in the debug log; it never shows made-up playback.
 
 ## Build notes
 

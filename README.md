@@ -23,7 +23,7 @@ The music card is meant to show and control Spotify playing on **another** devic
 
 - It may stop working whenever Spotify changes its internal services.
 - Using an unofficial client may break Spotify's terms of service; use it at your own risk.
-- Sign-in happens on Spotify's own login page. The app never sees your password; it keeps Spotify's reusable stored credential on the iPad.
+- Sign-in is by pairing: the iPad shows a code, and you approve it at spotify.com/pair on your phone or computer. The app never sees your password; it keeps Spotify's reusable stored credential on the iPad.
 - It uses a librespot fork ([fantasybot-red/librespot](https://github.com/fantasybot-red/librespot)) that identifies as macOS on iOS, because Spotify rejects librespot's iOS identity.
 
 Status and evidence: [docs/spotify-feasibility.md](docs/spotify-feasibility.md) and the [librespot spike](spikes/librespot-remote/README.md).

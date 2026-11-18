@@ -1189,7 +1189,7 @@ fn unavailable_view(reason: Memo<String>) -> impl IntoElement {
 fn signed_out_view(spotify_state: Signal<SpotifyState>) -> impl IntoElement {
     state_column("spotify_signed_out")
         .child(state_title("Control Spotify here"))
-        .child(state_note("Sign in once on Spotify's page to play, pause and skip."))
+        .child(state_note("Pair once with a code from your phone or computer to play, pause and skip."))
         .child(music_button(
             spotify_state,
             SpotifyCommand::SignIn,
@@ -1956,8 +1956,8 @@ mod tests {
         app.wait_for("id:spotify_sign_in").unwrap();
         app.press("id:spotify_sign_in").unwrap();
         let started = (0..50).any(|_| {
-            if crate::debug_log::text().contains("sign-in: listener bound")
-                || crate::debug_log::text().contains("sign-in failed")
+            if crate::debug_log::text().contains("sign-in: pairing task started")
+                || crate::debug_log::text().contains("pairing code request failed")
             {
                 return true;
             }

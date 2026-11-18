@@ -1,23 +1,19 @@
 //! Spotify Connect boundary between the dashboard and the experimental librespot backend.
 //!
 //! The UI only depends on [`SpotifyState`], [`Playback`], [`SpotifyCommand`], [`start`] and
-//! [`send`]. The backend signs in on Spotify's own login page (OAuth PKCE, `auth`), logs a
+//! [`send`]. The backend signs in by pairing (a code approved at spotify.com/pair), logs a
 //! librespot session in, keeps Spotify's reusable stored credential, observes the account's
 //! Spotify Connect devices without becoming a player, and remote-controls the active device.
 //! See `README.md` in this directory.
-use std::{cell::RefCell, rc::Rc};
+use std::cell::{Cell, RefCell};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use nsh_core::{
-    auth_session::{AuthSessionOutcome, AuthSessionRequest},
-    prelude::*,
-    storage::Storage,
-};
+use librespot::oauth::DeviceAuthClientBuilder;
+use nsh_core::{prelude::*, storage::Storage};
 use tokio::sync::mpsc;
 
 use crate::debug_log as dlog;
 
-pub mod auth;
 pub mod connect;
 mod session;
 
@@ -28,7 +24,7 @@ pub enum SpotifyState {
     Unavailable(String),
     /// No saved Spotify login; the user can sign in.
     SignedOut,
-    /// Unused by the login5 backend; kept so older UI code still compiles.
+    /// Pairing: the user enters `code` at `url` (spotify.com/pair) on a phone or computer.
     AwaitingApproval { code: String, url: String },
     /// Signing in or connecting to Spotify.
     Connecting,
@@ -58,7 +54,7 @@ pub struct Playback {
 /// User actions sent from the dashboard to the backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpotifyCommand {
-    /// Open Spotify's login page.
+    /// Start pairing (shows a code to approve at spotify.com/pair).
     SignIn,
     SignOut,
     PlayPause,
@@ -70,11 +66,16 @@ const KEY_USERNAME: &str = "spotify.username";
 /// Spotify's reusable "stored credential" (base64). Never the password.
 const KEY_CREDENTIALS: &str = "spotify.stored_credentials";
 const KEY_DEVICE: &str = "spotify.observer_device_id";
-const CALLBACK_SCHEME: &str = "ihomeview";
+/// Spotify for Desktop ("keymaster"): enabled for device pairing, and the client the macOS
+/// identity of the fantasybot-red librespot fork logs in as.
+const PAIR_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
+const PAIR_SCOPES: &[&str] = &["streaming"];
 /// Left by the old OAuth backend; removed on start.
 const KEY_OLD_REFRESH: &str = "spotify.refresh_token";
 
 thread_local! {
+    /// Bumped by each sign-in or cancel, so a superseded pairing stops quietly.
+    static PAIRING: Cell<u64> = const { Cell::new(0) };
     /// The running session's request channel (engine thread only).
     static SESSION: RefCell<Option<mpsc::UnboundedSender<session::Request>>> = const { RefCell::new(None) };
 }
@@ -166,66 +167,73 @@ fn start_session(state: Signal<SpotifyState>, login: session::Login) {
     }));
 }
 
-/// Sign-in on Spotify's page: a loopback listener on 127.0.0.1:8898 catches the redirect while
-/// the page shows in an in-app auth session; the code is exchanged for an access token.
+/// Sign-in by pairing (OAuth device authorization, RFC 8628): Spotify issues a short code, the
+/// iPad shows it, and the user approves it at spotify.com/pair on a phone or computer while the
+/// app polls. No browser on the iPad and nothing listening on a port.
 fn sign_in(state: Signal<SpotifyState>) {
-    dlog::info("sign-in: opening Spotify login page (loopback 127.0.0.1:8898)");
+    dlog::info("sign-in: requesting a pairing code (device authorization)");
     stop_session();
     state.set(SpotifyState::Connecting);
-    let pkce = auth::Pkce::new();
-    let url = pkce.authorize_url();
-    let finished = Rc::new(RefCell::new(false));
+    let attempt = PAIRING.with(|p| {
+        let next = p.get() + 1;
+        p.set(next);
+        next
+    });
 
-    // Detached and run from an engine task, so it outlives the sign-in button and has the
-    // tokio runtime context `background` needs.
+    // Detached engine task: outlives the button, and has the tokio context `background` needs.
     Owner::detached().run(move || {
-        let done = finished.clone();
         spawn(async move {
-            let listener_pkce = pkce.clone();
-            let token_task = background(async move {
-                let listener = auth::bind_listener().await?;
-                crate::debug_log::info("sign-in: listener bound, waiting for redirect");
-                let code = auth::wait_for_code(listener, &listener_pkce.state).await?;
-                crate::debug_log::info("sign-in: redirect received, exchanging code");
-                auth::exchange_code(&code, &listener_pkce).await
-            });
-            let result = match token_task.await {
-                Ok(result) => result,
-                Err(_) => Err(auth::AuthError::Listener("task stopped".into())),
-            };
-            *done.borrow_mut() = true;
-            close_auth_session();
-            match result {
-                Ok(tokens) => {
-                    dlog::info("sign-in: access token received");
-                    start_session(state, session::Login::Token(tokens.access_token));
-                }
-                Err(auth::AuthError::Denied(e)) if e == "access_denied" => state.set(SpotifyState::SignedOut),
+            dlog::info("sign-in: pairing task started");
+            let client = match DeviceAuthClientBuilder::new(PAIR_CLIENT_ID, PAIR_SCOPES.to_vec()).build() {
+                Ok(c) => std::sync::Arc::new(c),
                 Err(e) => {
-                    dlog::error(format!("sign-in failed: {e:?}"));
-                    state.set(SpotifyState::Error(e.to_string()));
+                    dlog::error(format!("pairing client: {e:?}"));
+                    state.set(SpotifyState::Error(format!("Spotify sign-in unavailable ({e}).")));
+                    return;
                 }
-            }
-        });
-
-        let page = open_auth_session(AuthSessionRequest::new(url, CALLBACK_SCHEME));
-        spawn(async move {
-            let outcome = page.await;
-            dlog::info(format!("sign-in: auth page closed: {outcome:?}"));
-            if *finished.borrow() {
+            };
+            let requester = client.clone();
+            let auth = match background(async move { requester.request_device_code_async().await }).await {
+                Ok(Ok(auth)) => auth,
+                Ok(Err(e)) => {
+                    dlog::error(format!("pairing code request failed: {e:?}"));
+                    state.set(SpotifyState::Error(format!("Could not get a Spotify pairing code ({e}).")));
+                    return;
+                }
+                Err(_) => return,
+            };
+            dlog::info(format!("sign-in: pairing code {} at {}", auth.user_code(), auth.url()));
+            if PAIRING.with(|p| p.get()) != attempt {
                 return;
             }
-            let cancelled = matches!(outcome, Ok(AuthSessionOutcome::Cancelled));
-            // Give the listener a moment in case the redirect is still arriving.
-            timer(std::time::Duration::from_millis(800)).await;
-            if *finished.borrow() {
-                return;
-            }
-            state.set(if cancelled {
-                SpotifyState::SignedOut
-            } else {
-                SpotifyState::Error("Could not open the Spotify sign-in page.".into())
+            state.set(SpotifyState::AwaitingApproval {
+                code: auth.user_code().to_owned(),
+                url: auth.verification_uri().trim_start_matches("https://").to_owned(),
             });
+            let poller = client.clone();
+            let token = background(async move { poller.poll_for_token_async(&auth).await }).await;
+            if PAIRING.with(|p| p.get()) != attempt {
+                dlog::info("sign-in: pairing cancelled");
+                return;
+            }
+            match token {
+                Ok(Ok(token)) => {
+                    dlog::info("sign-in: paired, access token received");
+                    start_session(state, session::Login::Token(token.access_token));
+                }
+                Ok(Err(e)) => {
+                    dlog::error(format!("pairing failed: {e:?}"));
+                    let text = e.to_string();
+                    state.set(if text.contains("access_denied") {
+                        SpotifyState::SignedOut
+                    } else if text.contains("expired") {
+                        SpotifyState::Error("The pairing code expired. Try again.".into())
+                    } else {
+                        SpotifyState::Error(format!("Spotify pairing failed ({text})."))
+                    });
+                }
+                Err(_) => {}
+            }
         });
     });
 }
@@ -247,6 +255,7 @@ pub fn send(state: Signal<SpotifyState>, command: SpotifyCommand) {
     match command {
         SpotifyCommand::SignIn => sign_in(state),
         SpotifyCommand::SignOut => {
+            PAIRING.with(|p| p.set(p.get() + 1));
             dlog::info("spotify: sign out");
             stop_session();
             forget_login();
