@@ -26,6 +26,9 @@ rand = "0.8"
 url = "2"
 hex = "0.4"
 log = "0.4"
+# librespot-core 0.8.0's build script fails with vergen 9.1 (vergen-lib version split).
+# Pinned here, not only in Cargo.lock, because `nsh package` resolves a fresh lockfile.
+vergen = { version = "=9.0.6", default-features = false }
 
 [dev-dependencies]
 nsh-engine = "=0.6.0"
