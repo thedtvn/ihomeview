@@ -23,7 +23,7 @@ The music card is meant to show and control Spotify playing on **another** devic
 
 - It may stop working whenever Spotify changes its internal services.
 - Using an unofficial client may break Spotify's terms of service; use it at your own risk.
-- Sign-in happens on Spotify's own login page. The app never asks for or stores your password; only a refresh token is stored on the iPad.
+- You sign in inside the app with your Spotify email/username and password (librespot login5, as Spotify's iOS app does). The password is sent only to Spotify and is not saved; the iPad keeps Spotify's reusable stored credential.
 
 Status and evidence: [docs/spotify-feasibility.md](docs/spotify-feasibility.md) and the [librespot spike](spikes/librespot-remote/README.md).
 

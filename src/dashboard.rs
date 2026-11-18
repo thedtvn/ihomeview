@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use chrono::{Datelike, Local, Timelike};
 use nsh_base::theme;
-use nsh_core::{Checked, prelude::*, time::unix_ms};
+use nsh_core::{AutoFill, Checked, element::input, prelude::*, time::unix_ms};
 
 use crate::spotify::{self, Playback, SpotifyCommand, SpotifyState};
 
@@ -37,8 +37,24 @@ const PRESET_TEXTS: [&str; 4] = ["5m", "15m", "25m", "45m"];
 const DEFAULT_SECS: i64 = 15 * 60;
 /// Longest settable timer: 23:59:59.
 const MAX_SECS: i64 = 24 * 3600 - 1;
-/// Points of vertical drag per step of a timer digit.
-const DRAG_STEP_PT: f32 = 22.0;
+/// Height of one number row in a timer wheel; the wheels snap to multiples of it.
+const WHEEL_ROW_PT: f32 = 44.0;
+/// Rows a timer wheel shows at once (the middle one is the selected value).
+const WHEEL_ROWS: f32 = 5.0;
+/// Width of one timer wheel (the numbers, right-aligned) and of the "hours"/"min"/"sec" label
+/// that sits beside the centered number.
+const WHEEL_W_PT: f32 = 52.0;
+const WHEEL_LABEL_W_PT: f32 = 46.0;
+/// Width of the timer panel (and of the header column above it) in landscape.
+const PANEL_W_PT: f32 = 360.0;
+/// The timer panel's own background (CARD over the page), so the wheels can fade into it.
+const PANEL_BG: u32 = 0x171719ff;
+/// Alarm tone: pitch (Hz), one beep's length (s) and the whole clip's length (s).
+const ALARM_HZ: f32 = 880.0;
+const ALARM_BEEP_S: f32 = 0.16;
+const ALARM_CLIP_S: f32 = 1.2;
+/// The alarm repeats until dismissed, but gives up after this many clips (about 5 minutes).
+const ALARM_MAX_REPEATS: u32 = 250;
 
 // Palette: near-black desk display, warm amber for the timer and Dim, green for Music.
 const MUTED: u32 = 0xffffff99;
@@ -114,6 +130,54 @@ impl TimeUnit {
             TimeUnit::Minutes | TimeUnit::Seconds => 59,
         }
     }
+
+    /// This unit's value within `total_secs`.
+    fn part(self, total_secs: i64) -> i64 {
+        let (h, m, s) = split_hms(total_secs);
+        match self {
+            TimeUnit::Hours => h,
+            TimeUnit::Minutes => m,
+            TimeUnit::Seconds => s,
+        }
+    }
+}
+
+/// A 16-bit mono WAV of two short beeps then silence, made in code so the app ships no sound file.
+fn alarm_wav() -> Vec<u8> {
+    const RATE: u32 = 22_050;
+    let total = (ALARM_CLIP_S * RATE as f32) as usize;
+    let beep = (ALARM_BEEP_S * RATE as f32) as usize;
+    let gap = beep / 2;
+    let mut pcm: Vec<u8> = Vec::with_capacity(total * 2);
+    for i in 0..total {
+        // Beep, short gap, beep, then silence for the rest of the clip.
+        let in_beep = i < beep || (i >= beep + gap && i < 2 * beep + gap);
+        let local = if i < beep { i } else { i.saturating_sub(beep + gap) };
+        let sample = if in_beep {
+            // A short fade in and out stops the clicks.
+            let edge = (local.min(beep.saturating_sub(local)) as f32 / 200.0).min(1.0);
+            let t = i as f32 / RATE as f32;
+            ((t * ALARM_HZ * std::f32::consts::TAU).sin() * 0.6 * edge * i16::MAX as f32) as i16
+        } else {
+            0
+        };
+        pcm.extend_from_slice(&sample.to_le_bytes());
+    }
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&pcm);
+    wav
 }
 
 /// `total_secs` with one unit moved by `steps` (clamped within that unit, the others kept).
@@ -208,10 +272,10 @@ pub fn Dashboard() -> impl IntoElement {
                 let now = unix_ms();
                 let left = ((deadline_ms - now) / 1000.0).ceil() as i64;
                 if left <= 0 {
-                    // Finished: put the timer away and flag it in the header until tapped.
+                    // Finished: back to the set time and raise the alarm until it is dismissed.
+                    // The panel stays as it was.
                     remaining_secs.set(duration_secs.get_untracked());
                     running.set(false);
-                    timer_open.set(false);
                     timer_finished.set(true);
                     break;
                 } else {
@@ -244,7 +308,6 @@ pub fn Dashboard() -> impl IntoElement {
                         remaining_secs,
                         running,
                         timer_open,
-                        timer_finished,
                     ))
                     .child(
                         view()
@@ -252,12 +315,15 @@ pub fn Dashboard() -> impl IntoElement {
                             .style_when(is_landscape, |s| s.flex_1().flex_row())
                             .child(music_card(spotify_state))
                             .child(when(timer_open, move || {
-                                focus_timer_panel(duration_secs, remaining_secs, running, timer_open)
+                                focus_timer_panel(duration_secs, remaining_secs, running)
                             })),
                     ),
             ),
         )
         .child(night_dim_overlay(night_dim))
+        .child(when(timer_finished, move || {
+            timer_alert(duration_secs, remaining_secs, running, timer_finished)
+        }))
         .child(when(debug_open, move || debug_overlay(debug_open, spotify_state)))
 }
 
@@ -276,7 +342,6 @@ fn top_band(
     remaining_secs: Signal<i64>,
     running: Signal<bool>,
     timer_open: Signal<bool>,
-    timer_finished: Signal<bool>,
 ) -> impl IntoElement {
     view()
         .gap(px(16.0))
@@ -285,7 +350,7 @@ fn top_band(
         .child(
             view()
                 .gap(px(12.0))
-                .style_when(is_landscape, |s| s.w(px(320.0)))
+                .style_when(is_landscape, |s| s.w(px(PANEL_W_PT)))
                 .child(
                     view()
                         .flex_row()
@@ -297,7 +362,6 @@ fn top_band(
                             remaining_secs,
                             running,
                             timer_open,
-                            timer_finished,
                         ))
                         .child(hour_cycle_toggle(twelve_hour))
                         .child(night_dim_toggle(night_dim)),
@@ -403,46 +467,23 @@ fn night_dim_toggle(night_dim: Signal<bool>) -> impl IntoElement {
 // ---------------------------------------------------------------------------------------------
 
 /// The one header control for the timer, which also closes the panel (there is no Close button):
-/// idle → "Timer" (toggles the panel); running or paused → the remaining time (toggles the panel);
-/// just finished → "Time's up" until tapped.
+/// idle â†’ "Timer" (toggles the panel); running or paused â†’ the remaining time (toggles the panel).
+/// When the time runs out the full-screen `timer_alert` takes over; the header stays plain.
 fn timer_header_button(
     duration_secs: Signal<i64>,
     remaining_secs: Signal<i64>,
     running: Signal<bool>,
     timer_open: Signal<bool>,
-    timer_finished: Signal<bool>,
 ) -> impl IntoElement {
-    // 0 idle, 1 engaged (running or paused part-way), 2 finished.
+    // 0 idle, 1 engaged (running or paused part-way).
     let mode = computed(move || {
-        if timer_finished.get() {
-            2u8
-        } else if running.get() || remaining_secs.get() < duration_secs.get() {
-            1
+        if running.get() || remaining_secs.get() < duration_secs.get() {
+            1u8
         } else {
             0
         }
     });
     dynamic(move || match mode.get() {
-        2 => view()
-            .role(AccessibilityRole::Button)
-            .test_id("timer_finished")
-            .label("Focus timer finished")
-            .hint("Dismisses the alert")
-            .on_press(move || timer_finished.set(false))
-            .min_h(px(48.0))
-            .px(px(20.0))
-            .items_center()
-            .justify_center()
-            .rounded_full()
-            .bg(rgba(AMBER))
-            .active(|s| s.opacity(0.8))
-            .child(
-                text("Time's up")
-                    .text_size(px(16.0))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgba(0x1a1203ff)),
-            )
-            .into_element(),
         1 => view()
             .role(AccessibilityRole::Button)
             .test_id("timer_indicator")
@@ -501,7 +542,6 @@ fn focus_timer_panel(
     duration_secs: Signal<i64>,
     remaining_secs: Signal<i64>,
     running: Signal<bool>,
-    timer_open: Signal<bool>,
 ) -> impl IntoElement {
     view()
         .test_id("timer_panel")
@@ -511,7 +551,7 @@ fn focus_timer_panel(
         .border_1()
         .border_color(rgba(HAIRLINE))
         .bg(rgba(CARD))
-        .style_when(is_landscape, |s| s.w(px(320.0)))
+        .style_when(is_landscape, |s| s.w(px(PANEL_W_PT)))
         .child(
             text("Focus timer")
                 .role(AccessibilityRole::Header)
@@ -519,12 +559,15 @@ fn focus_timer_panel(
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgba(MUTED)),
         )
-        // Running: the countdown, leading zero units hidden. Stopped: drag the digits to set it.
+        // Running: the countdown, centered, leading zero units hidden.
+        // Stopped: the iOS-style wheel picker.
         .child(
             when(running, move || {
                 text(move || format_remaining(remaining_secs.get()))
                     .test_id("timer_remaining")
                     .role(AccessibilityRole::Timer)
+                    .w_full()
+                    .text_center()
                     .text_size(px(72.0))
                     .font_weight(FontWeight::BOLD)
                     .tabular_nums()
@@ -544,98 +587,206 @@ fn focus_timer_panel(
                 .flex_row()
                 .gap(px(10.0))
                 .child(run_pause_button(remaining_secs, running))
-                .child(reset_button(duration_secs, remaining_secs, running, timer_open)),
+                .child(reset_button(duration_secs, remaining_secs, running)),
         )
 }
 
-/// Hours, minutes and seconds side by side; drag one up or down to change it. Zero units are
-/// dimmed here, and the running countdown hides them (`format_remaining`).
+/// An iOS Clock-style picker: three wheels (hours, minutes, seconds) that you flick or drag. Each
+/// wheel snaps so one number rests in the highlighted band in the middle, with its unit label
+/// beside it. Numbers above and below fade out. Presets move the wheels too.
 fn timer_editor(duration_secs: Signal<i64>, remaining_secs: Signal<i64>) -> impl IntoElement {
+    let wheel_h = WHEEL_ROW_PT * WHEEL_ROWS;
+    let fade_h = WHEEL_ROW_PT * 2.0;
+    // The panel's own color, opaque at the outer edge and clear towards the band.
+    let fade_from = rgba((PANEL_BG & 0xffffff00) | 0xf0);
+    let fade_to = rgba(PANEL_BG & 0xffffff00);
     view()
         .test_id("timer_editor")
-        .gap(px(4.0))
+        .w_full()
+        .h(px(wheel_h))
+        // The selection band, behind the wheels, spanning all three.
+        .child(
+            view()
+                .absolute()
+                .top(px(fade_h))
+                .left(px(0.0))
+                .right(px(0.0))
+                .h(px(WHEEL_ROW_PT))
+                .rounded(px(12.0))
+                .bg(rgba(0xffffff1f))
+                .pointer_events(PointerEvents::None)
+                .accessibility_elements_hidden(true),
+        )
         .child(
             view()
                 .flex_row()
-                .items_end()
+                .items_center()
                 .justify_center()
-                .gap(px(6.0))
-                .child(time_wheel(TimeUnit::Hours, duration_secs, remaining_secs))
-                .child(time_colon())
-                .child(time_wheel(TimeUnit::Minutes, duration_secs, remaining_secs))
-                .child(time_colon())
-                .child(time_wheel(TimeUnit::Seconds, duration_secs, remaining_secs)),
+                .gap(px(8.0))
+                .w_full()
+                .h(px(wheel_h))
+                .child(time_unit(TimeUnit::Hours, duration_secs, remaining_secs))
+                .child(time_unit(TimeUnit::Minutes, duration_secs, remaining_secs))
+                .child(time_unit(TimeUnit::Seconds, duration_secs, remaining_secs)),
+        )
+        // Fade the rows away from the band.
+        .child(
+            view()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .h(px(fade_h))
+                .bg_linear_to_b()
+                .gradient_from(fade_from)
+                .gradient_to(fade_to)
+                .pointer_events(PointerEvents::None)
+                .accessibility_elements_hidden(true),
         )
         .child(
-            text("Drag a number up or down to change it")
-                .test_id("timer_drag_hint")
-                .text_size(px(14.0))
-                .text_center()
-                .text_color(rgba(FAINT)),
+            view()
+                .absolute()
+                .bottom(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .h(px(fade_h))
+                .bg_linear_to_t()
+                .gradient_from(fade_from)
+                .gradient_to(fade_to)
+                .pointer_events(PointerEvents::None)
+                .accessibility_elements_hidden(true),
         )
 }
 
-fn time_colon() -> impl IntoElement {
-    text(":")
-        .text_size(px(52.0))
-        .font_weight(FontWeight::BOLD)
-        .text_color(rgba(FAINT))
-        .pb(px(20.0))
+fn unit_label(unit: TimeUnit) -> &'static str {
+    match unit {
+        TimeUnit::Hours => "hours",
+        TimeUnit::Minutes => "min",
+        TimeUnit::Seconds => "sec",
+    }
 }
 
+/// One wheel and its unit label, beside the centered number like Apple's.
+fn time_unit(unit: TimeUnit, duration_secs: Signal<i64>, remaining_secs: Signal<i64>) -> impl IntoElement {
+    view()
+        .flex_row()
+        .items_center()
+        .child(time_wheel(unit, duration_secs, remaining_secs))
+        .child(
+            text(unit_label(unit))
+                .w(px(WHEEL_LABEL_W_PT))
+                .pl(px(2.0))
+                .text_size(px(16.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(white())
+                .accessibility_elements_hidden(true),
+        )
+}
+
+/// A vertical scroll view of numbers `0..=max`, one row tall each, with two empty rows of room
+/// above and below, so scrolling to `value * row` puts that value in the middle row. The native
+/// scroll view does the snapping; we read the row it rests on, and scroll it when the value
+/// changes from outside (a preset).
 fn time_wheel(unit: TimeUnit, duration_secs: Signal<i64>, remaining_secs: Signal<i64>) -> impl IntoElement {
-    let (test_id, suffix, name) = match unit {
-        TimeUnit::Hours => ("timer_hours", "h", "Hours"),
-        TimeUnit::Minutes => ("timer_minutes", "m", "Minutes"),
-        TimeUnit::Seconds => ("timer_seconds", "s", "Seconds"),
+    let (test_id, name) = match unit {
+        TimeUnit::Hours => ("timer_hours", "Hours"),
+        TimeUnit::Minutes => ("timer_minutes", "Minutes"),
+        TimeUnit::Seconds => ("timer_seconds", "Seconds"),
     };
-    let value = computed(move || {
-        let (h, m, s) = split_hms(remaining_secs.get());
-        match unit {
-            TimeUnit::Hours => h,
-            TimeUnit::Minutes => m,
-            TimeUnit::Seconds => s,
+    let value = computed(move || unit.part(remaining_secs.get()));
+    let initial = unit.part(remaining_secs.get_untracked());
+    let wheel = element_ref();
+    // The row the wheel is at (or is being scrolled to by us), so we only scroll it when the
+    // value changed from outside.
+    let shown = stored(initial);
+    // Set while we scroll the wheel ourselves: its scroll events are not the user's.
+    let pending = stored(None::<i64>);
+
+    effect(move || {
+        let v = value.get();
+        if v != shown.get() {
+            shown.replace(v);
+            pending.replace(Some(v));
+            wheel.scroll_to(point(px(0.0), px(v as f32 * WHEEL_ROW_PT)), true);
         }
     });
-    let start_total = stored(0_i64);
-    let dragging = signal(false);
-    let set_total = move |total: i64| {
-        duration_secs.set(total);
-        remaining_secs.set(total);
+
+    let set_unit = move |idx: i64| {
+        let cur = remaining_secs.get_untracked();
+        let total = adjust_unit(cur, unit, idx - unit.part(cur));
+        if total != cur {
+            duration_secs.set(total);
+            remaining_secs.set(total);
+        }
     };
-    view()
-        .test_id(test_id)
-        .label(move || format!("{name}: {}", value.get()))
-        .min_w(px(78.0))
-        .py(px(6.0))
-        .items_center()
-        .rounded(px(14.0))
-        .bg(move || if dragging.get() { rgba(0xffffff1f) } else { rgba(0xffffff08) })
-        // Vertical drags only, so a sideways swipe still scrolls the page.
-        .claim_touches(TouchClaim::on_pan(PanActivation::vertical(px(4.0), px(24.0))))
-        .keep_touches(true)
-        .on_responder_grant(move |_: &ResponderEvent| {
-            start_total.replace(remaining_secs.get_untracked());
-            dragging.set(true);
-        })
-        .on_responder_move(move |e: &ResponderEvent| {
-            // Up = more.
-            let steps = (-e.gesture.delta.y.0 / DRAG_STEP_PT).trunc() as i64;
-            let total = adjust_unit(start_total.get(), unit, steps);
-            if total != remaining_secs.get_untracked() {
-                set_total(total);
+    // The wheel reached `offset_y`: the row there is the new value.
+    let settle = move |offset_y: f32| {
+        let idx = ((offset_y / WHEEL_ROW_PT).round() as i64).clamp(0, unit.max());
+        if let Some(target) = pending.get() {
+            if idx == target {
+                pending.replace(None);
             }
+            return;
+        }
+        if idx != shown.get() {
+            shown.replace(idx);
+            set_unit(idx);
+        }
+    };
+
+    let rows = (0..=unit.max()).map(move |i| {
+        view()
+            .w_full()
+            .h(px(WHEEL_ROW_PT))
+            .items_end()
+            .justify_center()
+            .pr(px(8.0))
+            .child(
+                text(i.to_string())
+                    .text_size(px(30.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .tabular_nums()
+                    .text_color(move || {
+                        rgba(match (value.get() - i).abs() {
+                            0 => 0xffffffff,
+                            1 => 0xffffff8c,
+                            2 => 0xffffff47,
+                            _ => 0xffffff26,
+                        })
+                    }),
+            )
+    });
+
+    scroll()
+        .test_id(test_id)
+        .w(px(WHEEL_W_PT))
+        .h(px(WHEEL_ROW_PT * WHEEL_ROWS))
+        .scrollbar(false)
+        .bounces(false)
+        .snap_interval(px(WHEEL_ROW_PT))
+        .snap_alignment(SnapAlignment::Start)
+        .deceleration(0.99_f32)
+        .content_offset(point(px(0.0), px(initial as f32 * WHEEL_ROW_PT)))
+        .element_ref(&wheel)
+        .on_scroll_drag_start(move |_: &Point<Points>| {
+            pending.replace(None);
         })
-        .on_responder_release(move |_: &ResponderEvent| dragging.set(false))
-        .on_responder_terminate(move |_: &ResponderEvent| dragging.set(false))
-        .child(
-            text(move || format!("{:02}", value.get()))
-                .text_size(px(60.0))
-                .font_weight(FontWeight::BOLD)
-                .tabular_nums()
-                .text_color(move || if value.get() == 0 { rgba(FAINT) } else { rgba(0xffffffff) }),
-        )
-        .child(text(suffix).text_size(px(14.0)).text_color(rgba(MUTED)))
+        .on_scroll(move |e: &ScrollEvent| settle(e.offset.y.0))
+        .on_scroll_end(move |at: &Point<Points>| settle(at.y.0))
+        // One element for screen readers: "Hours: 2", adjustable with swipes up and down.
+        .accessible(true)
+        .role(AccessibilityRole::Adjustable)
+        .label(move || format!("{name}: {}", value.get()))
+        .accessibility_actions(vec![
+            nsh_core::AccessibilityActionDef { name: "increment".into(), label: None },
+            nsh_core::AccessibilityActionDef { name: "decrement".into(), label: None },
+        ])
+        .on_accessibility_action(move |action: &str| match action {
+            "increment" => set_unit((value.get_untracked() + 1).min(unit.max())),
+            "decrement" => set_unit((value.get_untracked() - 1).max(0)),
+            _ => {}
+        })
+        .child(view().w_full().py(px(WHEEL_ROW_PT * 2.0)).child(rows))
 }
 
 fn preset_button(
@@ -712,18 +863,17 @@ fn run_pause_button(remaining_secs: Signal<i64>, running: Signal<bool>) -> impl 
         )
 }
 
-/// Reset stops the countdown, restores the set time and puts the timer away.
+/// Reset stops the countdown and restores the set time; the panel stays open on the picker.
 fn reset_button(
     duration_secs: Signal<i64>,
     remaining_secs: Signal<i64>,
     running: Signal<bool>,
-    timer_open: Signal<bool>,
 ) -> impl IntoElement {
     view()
         .role(AccessibilityRole::Button)
         .test_id("timer_reset")
         .label("Reset")
-        .hint("Resets the timer and hides it")
+        .hint("Stops the timer and goes back to the time you set")
         .min_w(px(72.0))
         .min_h(px(56.0))
         .px(px(16.0))
@@ -736,13 +886,135 @@ fn reset_button(
         .on_press(move || {
             running.set(false);
             remaining_secs.set(duration_secs.get());
-            timer_open.set(false);
         })
         .child(
             text("Reset")
                 .text_size(px(18.0))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(white()),
+        )
+}
+
+/// The "Time's up" alert: covers the dashboard, pulses amber, and rings until dismissed.
+/// Dismiss closes it (the timer is already back at the set time); Restart runs the same time again.
+fn timer_alert(
+    duration_secs: Signal<i64>,
+    remaining_secs: Signal<i64>,
+    running: Signal<bool>,
+    timer_finished: Signal<bool>,
+) -> impl IntoElement {
+    let set_time = format_remaining(duration_secs.get_untracked());
+    let can_restart = duration_secs.get_untracked() > 0;
+
+    // The whole alert fades in; the ring glows in and out until the alert is gone.
+    let fade_in = motion().entering(MotionPreset::FadeIn);
+    let glow = motion().entering(MotionPreset::Glow);
+
+    // Rings until dismissed: the clip repeats. It stops with this view (closing the alert ends
+    // the task and the cleanup stops a clip that is mid-play). No sound where the platform has
+    // none (the headless tests) or the app is not allowed it: the alert is then visual only.
+    let sound = stored(None::<Sound>);
+    spawn(async move {
+        match load_sound(alarm_wav()).await {
+            Ok(clip) => {
+                sound.replace(Some(clip.clone()));
+                for _ in 0..ALARM_MAX_REPEATS {
+                    clip.play(1.0, 1.0);
+                    timer(Duration::from_millis((ALARM_CLIP_S * 1000.0) as u64)).await;
+                }
+            }
+            Err(e) => crate::debug_log::warn(format!("timer alarm has no sound: {e}")),
+        }
+    });
+    cleanup(move || {
+        if let Some(Some(clip)) = sound.try_with(|s| s.take()) {
+            clip.stop();
+        }
+    });
+
+    let big_button = |id: &'static str, label: &'static str, hint: &'static str, filled: bool| {
+        view()
+            .role(AccessibilityRole::Button)
+            .test_id(id)
+            .label(label)
+            .hint(hint)
+            .min_w(px(220.0))
+            .min_h(px(76.0))
+            .px(px(32.0))
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .border_2()
+            .border_color(rgba(AMBER))
+            .bg(if filled { rgba(AMBER) } else { rgba(0xffd2781a) })
+            .active(|s| s.opacity(0.75))
+            .child(
+                text(label)
+                    .text_size(px(28.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(if filled { rgba(0x1a1203ff) } else { rgba(AMBER) }),
+            )
+    };
+
+    view()
+        .test_id("timer_alert")
+        .role(AccessibilityRole::Alert)
+        .label("Time's up")
+        .absolute()
+        .inset_0()
+        .items_center()
+        .justify_center()
+        .gap(px(28.0))
+        .bg(rgba(0x120c02fa))
+        .bind_motion(&fade_in)
+        .child(
+            view()
+                .size(px(220.0))
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .border(px(6.0))
+                .border_color(rgba(AMBER))
+                .bg(rgba(0xffd27826))
+                .bind_motion(&glow)
+                .accessibility_elements_hidden(true)
+                .child(
+                    text("0:00")
+                        .text_size(px(72.0))
+                        .font_weight(FontWeight::BOLD)
+                        .tabular_nums()
+                        .text_color(rgba(AMBER)),
+                ),
+        )
+        .child(
+            text("Time's up")
+                .role(AccessibilityRole::Header)
+                .text_size(px(88.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(white()),
+        )
+        .child(
+            text(format!("Your {set_time} timer has finished"))
+                .text_size(px(26.0))
+                .text_color(rgba(MUTED)),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap(px(16.0))
+                .pt(px(12.0))
+                .child(
+                    big_button("timer_finished_dismiss", "Dismiss", "Stops the alarm", true)
+                        .on_press(move || timer_finished.set(false)),
+                )
+                .child(when(move || can_restart, move || {
+                    big_button("timer_finished_restart", "Restart", "Runs the same time again", false)
+                        .on_press(move || {
+                            remaining_secs.set(duration_secs.get_untracked());
+                            timer_finished.set(false);
+                            running.set(true);
+                        })
+                })),
         )
 }
 
@@ -888,17 +1160,84 @@ fn unavailable_view(reason: Memo<String>) -> impl IntoElement {
         .child(state_note(move || reason.get()).text_center().max_w(px(560.0)))
 }
 
+fn login_field(test_id: &'static str, placeholder: &'static str, value: Signal<String>) -> Input {
+    input()
+        .test_id(test_id)
+        .label(placeholder)
+        .placeholder(placeholder)
+        .value(move || value.get())
+        .on_change(move |text: &str| value.set(text.to_owned()))
+        .auto_capitalize(AutoCapitalize::None)
+        .auto_correct(false)
+        .keyboard_appearance(KeyboardAppearance::Dark)
+        .w(px(420.0))
+        .min_h(px(56.0))
+        .px(px(18.0))
+        .rounded(px(14.0))
+        .border_1()
+        .border_color(rgba(0xffffff33))
+        .bg(rgba(0xffffff0f))
+        .text_size(px(20.0))
+        .text_color(white())
+        .placeholder_color(rgba(FAINT))
+}
+
+/// In-app Spotify login (login5). The password goes only to Spotify; the app keeps Spotify's
+/// stored credential.
 fn signed_out_view(spotify_state: Signal<SpotifyState>) -> impl IntoElement {
+    let username = signal(String::new());
+    let password = signal(String::new());
+    let submit = move || {
+        let pw = password.get_untracked();
+        password.set(String::new());
+        spotify::sign_in_with_password(spotify_state, username.get_untracked(), pw);
+    };
     state_column("spotify_signed_out")
+        .gap(px(14.0))
         .child(state_title("Control Spotify here"))
-        .child(state_note("Sign in once to play, pause and skip."))
-        .child(music_button(
-            spotify_state,
-            SpotifyCommand::SignIn,
-            "spotify_sign_in",
-            "Sign in to Spotify",
-            true,
-        ))
+        .child(state_note("Sign in with your Spotify account to play, pause and skip."))
+        .child(
+            login_field("spotify_username", "Email or username", username)
+                .keyboard_type(KeyboardType::Email)
+                .auto_fill(AutoFill::Username)
+                .return_key_type(ReturnKeyType::Next),
+        )
+        .child(
+            login_field("spotify_password", "Password", password)
+                .masked(true)
+                .auto_fill(AutoFill::Password)
+                .return_key_type(ReturnKeyType::Go)
+                .on_submit(move |_: &str| submit()),
+        )
+        .child(
+            view()
+                .role(AccessibilityRole::Button)
+                .test_id("spotify_sign_in")
+                .label("Sign in to Spotify")
+                .disabled(move || username.get().trim().is_empty() || password.get().is_empty())
+                .opacity(move || {
+                    if username.get().trim().is_empty() || password.get().is_empty() { 0.5_f32 } else { 1.0 }
+                })
+                .on_press(move || submit())
+                .min_h(px(60.0))
+                .w(px(420.0))
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(rgba(GREEN))
+                .active(|s| s.opacity(0.75))
+                .child(
+                    text("Sign in to Spotify")
+                        .text_size(px(22.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgba(ON_GREEN)),
+                ),
+        )
+        .child(
+            text("Your password is sent only to Spotify and is not saved on this iPad.")
+                .text_size(px(14.0))
+                .text_color(rgba(FAINT)),
+        )
 }
 
 fn awaiting_view(
@@ -936,7 +1275,7 @@ fn awaiting_view(
 
 fn connecting_view() -> impl IntoElement {
     state_column("spotify_connecting").child(
-        text("Connecting to Spotify…")
+        text("Connecting to Spotifyâ€¦")
             .text_size(px(28.0))
             .font_weight(FontWeight::MEDIUM)
             .text_color(rgba(FAINT)),
@@ -1467,7 +1806,7 @@ mod tests {
     }
 
     #[test]
-    fn timer_reset_restores_time_and_hides_it() {
+    fn timer_reset_restores_time_and_keeps_the_panel_open() {
         let mut app = start_landscape();
         app.wait_for("id:timer_open").unwrap();
         app.press("id:timer_open").unwrap();
@@ -1476,26 +1815,127 @@ mod tests {
         app.press("id:timer_toggle").unwrap();
         app.wait_for("5:00").unwrap();
         app.wait_for("id:timer_indicator").unwrap();
+        assert_eq!(app.screen().count("id:timer_editor").unwrap(), 0);
         app.press("id:timer_reset").unwrap();
-        app.wait_for_gone("id:timer_panel", Duration::from_secs(5)).unwrap();
-        app.wait_for("id:timer_open").unwrap();
-        assert_eq!(app.screen().count("id:timer_indicator").unwrap(), 0);
-        // Opening again shows the set time, not a stale countdown.
-        app.press("id:timer_open").unwrap();
+        // The panel stays open and shows the picker again; the header indicator is gone.
         app.wait_for("id:timer_editor").unwrap();
-        app.wait_for("05").unwrap();
+        app.wait_for("id:timer_open").unwrap();
+        assert_eq!(app.screen().count("id:timer_panel").unwrap(), 1);
+        assert_eq!(app.screen().count("id:timer_indicator").unwrap(), 0);
+        assert_eq!(app.screen().count("id:timer_remaining").unwrap(), 0);
+        // The wheels show the set time (5 minutes), not a stale countdown.
+        app.wait_for("label:Minutes: 5").unwrap();
+        app.wait_for("label:Seconds: 0").unwrap();
     }
 
     #[test]
-    fn dragging_a_digit_changes_the_time() {
+    fn presets_move_the_wheels_and_the_wheels_set_the_time() {
         let mut app = start_landscape();
         app.wait_for("id:timer_open").unwrap();
         app.press("id:timer_open").unwrap();
-        app.wait_for("id:timer_hours").unwrap();
-        // Up by 2 steps (plus the pan slop) adds 2 hours to the default 15 minutes.
-        app.drag("id:timer_hours", nsh_core::geometry::point(px(0.0), px(-(2.0 * DRAG_STEP_PT + 15.0)))).unwrap();
-        app.wait_for("02").unwrap();
+        app.wait_for("id:timer_editor").unwrap();
+        // Three wheels, each with its test id and an accessible "Name: value" label.
+        for id in ["id:timer_hours", "id:timer_minutes", "id:timer_seconds"] {
+            app.wait_for(id).unwrap();
+        }
+        app.wait_for("label:Hours: 0").unwrap();
+        app.wait_for("label:Minutes: 15").unwrap();
+        app.wait_for("label:Seconds: 0").unwrap();
+        // A preset changes what the wheels show.
+        app.press("id:timer_preset_25").unwrap();
+        app.wait_for("label:Minutes: 25").unwrap();
+
+        // Scrolling a wheel by whole rows picks a value: 2 rows down the hours wheel is 2 hours.
+        // (Headless moves the scroll view's offset and fires its scroll events; it does not
+        // simulate the native snap, so this lands exactly on a row.)
+        app.scroll("id:timer_hours", px(2.0 * WHEEL_ROW_PT)).unwrap();
+        app.wait_for("label:Hours: 2").unwrap();
+        app.wait_for("label:Minutes: 25").unwrap();
         app.press("id:timer_toggle").unwrap();
+        app.wait_for("id:timer_remaining").unwrap();
+        app.wait_for("2:25:00").unwrap();
+    }
+
+    #[test]
+    fn dragging_a_wheel_changes_the_value() {
+        let mut app = start_landscape();
+        app.wait_for("id:timer_open").unwrap();
+        app.press("id:timer_open").unwrap();
+        app.wait_for("label:Minutes: 15").unwrap();
+        // A finger drag up by 3 rows moves the minutes wheel to 18 (a drag up scrolls down).
+        app.drag("id:timer_minutes", nsh_core::geometry::point(px(0.0), px(-(3.0 * WHEEL_ROW_PT)))).unwrap();
+        app.wait_for("label:Minutes: 18").unwrap();
+        app.press("id:timer_toggle").unwrap();
+        app.wait_for("id:timer_remaining").unwrap();
+        app.wait_for("18:00").unwrap();
+    }
+
+    #[test]
+    fn the_running_countdown_is_centered_in_the_panel() {
+        let mut app = start_landscape();
+        app.wait_for("id:timer_open").unwrap();
+        app.press("id:timer_open").unwrap();
+        app.wait_for("id:timer_toggle").unwrap();
+        app.press("id:timer_toggle").unwrap();
+        app.wait_for("id:timer_remaining").unwrap();
+        let nodes = app.screen().layout_nodes();
+        let find = |id: &str| {
+            nodes
+                .iter()
+                .find(|n| n.test_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("no node {id}"))
+                .bounds
+        };
+        let panel = find("timer_panel");
+        let remaining = find("timer_remaining");
+        let panel_mid = panel.origin.x.0 + panel.size.width.0 / 2.0;
+        let text_mid = remaining.origin.x.0 + remaining.size.width.0 / 2.0;
+        assert!((panel_mid - text_mid).abs() < 2.0, "countdown box not centered: {panel_mid} vs {text_mid}");
+    }
+
+    #[test]
+    fn time_up_raises_an_alert_until_dismissed() {
+        let mut app = start_landscape();
+        app.wait_for("id:timer_open").unwrap();
+        app.press("id:timer_open").unwrap();
+        app.wait_for("label:Minutes: 15").unwrap();
+        // Set 0:02: minutes wheel back to 0, seconds wheel to 2.
+        app.scroll("id:timer_minutes", px(-15.0 * WHEEL_ROW_PT)).unwrap();
+        app.wait_for("label:Minutes: 0").unwrap();
+        app.scroll("id:timer_seconds", px(2.0 * WHEEL_ROW_PT)).unwrap();
+        app.wait_for("label:Seconds: 2").unwrap();
+        assert_eq!(app.screen().count("id:timer_alert").unwrap(), 0);
+        app.press("id:timer_toggle").unwrap();
+        app.wait_for("id:timer_remaining").unwrap();
+
+        // Time runs out: a big alert appears with Dismiss and Restart; the panel stays open.
+        app.wait_for_within("id:timer_finished_dismiss", Duration::from_secs(8)).unwrap();
+        app.wait_for("id:timer_alert").unwrap();
+        app.wait_for("id:timer_finished_restart").unwrap();
+        assert_eq!(app.screen().count("id:timer_panel").unwrap(), 1);
+        assert_eq!(app.screen().count("id:timer_remaining").unwrap(), 0);
+        assert_eq!(app.screen().count("id:timer_indicator").unwrap(), 0);
+
+        // Dismiss: the alert goes, the picker shows the set time again.
+        app.press("id:timer_finished_dismiss").unwrap();
+        app.wait_for_gone("id:timer_alert", Duration::from_secs(5)).unwrap();
+        app.wait_for("id:timer_editor").unwrap();
+        app.wait_for("label:Seconds: 2").unwrap();
+    }
+
+    #[test]
+    fn restart_from_the_alert_runs_the_same_time_again() {
+        let mut app = start_landscape();
+        app.wait_for("id:timer_open").unwrap();
+        app.press("id:timer_open").unwrap();
+        app.wait_for("label:Minutes: 15").unwrap();
+        app.scroll("id:timer_minutes", px(-15.0 * WHEEL_ROW_PT)).unwrap();
+        app.scroll("id:timer_seconds", px(2.0 * WHEEL_ROW_PT)).unwrap();
+        app.wait_for("label:Seconds: 2").unwrap();
+        app.press("id:timer_toggle").unwrap();
+        app.wait_for_within("id:timer_finished_restart", Duration::from_secs(8)).unwrap();
+        app.press("id:timer_finished_restart").unwrap();
+        app.wait_for_gone("id:timer_alert", Duration::from_secs(5)).unwrap();
         app.wait_for("id:timer_remaining").unwrap();
     }
 
@@ -1541,11 +1981,17 @@ mod tests {
     }
 
     #[test]
-    fn music_signed_out_offers_sign_in() {
+    fn music_signed_out_offers_login_form() {
         let mut app = Headless::start(landscape_config(Root::of::<ProbeSignedOut>())).unwrap();
         app.wait_for("id:spotify_signed_out").unwrap();
-        app.wait_for("Sign in to Spotify").unwrap();
-        app.press("id:spotify_sign_in").unwrap();
+        app.wait_for("id:spotify_username").unwrap();
+        app.wait_for("id:spotify_password").unwrap();
+        // Disabled until both fields are filled.
+        assert!(!app.screen().enabled("id:spotify_sign_in").unwrap());
+        app.type_text("id:spotify_username", "someone@example.com").unwrap();
+        assert!(!app.screen().enabled("id:spotify_sign_in").unwrap());
+        app.type_text("id:spotify_password", "pw").unwrap();
+        assert!(app.screen().enabled("id:spotify_sign_in").unwrap());
     }
 
     #[test]

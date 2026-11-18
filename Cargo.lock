@@ -2010,7 +2010,6 @@ dependencies = [
  "hex",
  "libc",
  "librespot-core",
- "librespot-oauth",
  "librespot-protocol",
  "log",
  "nsh-base",
@@ -2020,11 +2019,8 @@ dependencies = [
  "protobuf",
  "rand 0.8.8",
  "reqwest",
- "serde",
  "serde_json",
- "sha2 0.10.9",
  "tokio",
- "url",
 ]
 
 [[package]]

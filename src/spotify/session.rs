@@ -9,6 +9,7 @@ use librespot_core::{
     Session, SessionConfig, SpotifyUri, authentication::Credentials, dealer::protocol::Message,
 };
 use librespot_protocol::{
+    authentication::AuthenticationType,
     connect::{Cluster, ClusterUpdate},
     metadata::Track,
 };
@@ -19,15 +20,32 @@ use tokio::sync::mpsc;
 use crate::debug_log as dlog;
 
 use super::{
-    Playback, auth,
+    Playback,
     connect::{self, RemoteCommand, TrackInfo},
 };
+
+/// How the session logs in.
+pub enum Login {
+    /// First sign-in: login5 with username/email + password (the password is never stored).
+    Password { username: String, password: String },
+    /// Later launches: Spotify's reusable stored credential from an earlier login.
+    Stored { username: String, auth_data: Vec<u8> },
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Login::Password { username, .. } => write!(f, "Password({username}, <hidden>)"),
+            Login::Stored { username, auth_data } => write!(f, "Stored({username}, {} bytes)", auth_data.len()),
+        }
+    }
+}
 
 /// What the session reports to the UI side.
 #[derive(Debug)]
 pub enum Event {
-    /// A (possibly rotated) refresh token to persist.
-    RefreshToken(String),
+    /// Spotify's reusable credential to persist (replaces the password).
+    Credentials { username: String, auth_data: Vec<u8> },
     Playback(Playback),
     /// A recoverable error with a short user-facing message.
     Error(String),
@@ -117,9 +135,25 @@ async fn send_command(session: &Session, own_id: &str, target: &str, cmd: Remote
         .map_err(short)
 }
 
+/// A short, user-facing message for a login failure, and whether the saved login is unusable.
+fn login_failure(err: &librespot_core::Error) -> (String, bool) {
+    let text = format!("{err}");
+    if text.contains("INVALID_CREDENTIALS") || text.contains("BadCredentials") || text.contains("UNKNOWN_IDENTIFIER") {
+        ("Wrong Spotify email/username or password.".into(), true)
+    } else if text.contains("Code challenge") {
+        ("Spotify asked for an email/SMS code, which this app cannot do yet.".into(), false)
+    } else if text.contains("TOO_MANY_ATTEMPTS") || text.contains("TRY_AGAIN_LATER") {
+        ("Spotify says too many attempts. Try again later.".into(), false)
+    } else if text.contains("PremiumAccountRequired") {
+        ("Spotify Premium is required.".into(), false)
+    } else {
+        (format!("Spotify login failed ({}).", short(err)), false)
+    }
+}
+
 /// Runs one session until it ends. `device_id` is the persisted observer id.
 pub async fn run(
-    refresh_token: String,
+    login: Login,
     device_id: String,
     events: mpsc::UnboundedSender<Event>,
     mut requests: mpsc::UnboundedReceiver<Request>,
@@ -133,36 +167,54 @@ pub async fn run(
         Event::Ended { message, signed_out }
     };
 
-    // 1. Fresh access token (refresh tokens can rotate).
-    dlog::info(format!("step 1/4: refreshing access token (device {device_id})"));
-    let tokens = match auth::refresh(&refresh_token).await {
-        Ok(t) => {
-            dlog::info(format!(
-                "step 1/4 ok: access token received, expires in {}s, rotated refresh: {}",
-                t.expires_in,
-                t.refresh_token.as_deref().is_some_and(|r| !r.is_empty() && r != refresh_token)
-            ));
-            t
-        }
-        Err(auth::AuthError::Exchange(e)) if e.starts_with("HTTP 400") || e.starts_with("HTTP 401") => {
-            let _ = events.send(ended(Some("Spotify sign-in expired. Please sign in again.".into()), true));
-            return;
-        }
-        Err(e) => {
-            let _ = events.send(ended(Some(e.to_string()), false));
-            return;
-        }
-    };
-    if let Some(rotated) = tokens.refresh_token.filter(|t| !t.is_empty() && *t != refresh_token) {
-        let _ = events.send(Event::RefreshToken(rotated));
-    }
-
-    // 2. Session with the same client id as the token, and our persisted observer id.
+    // Session with librespot's default client id for this OS (the iOS client on the iPad, which
+    // login5 password login requires) and our persisted observer id.
     let mut config = SessionConfig::default();
-    config.client_id = auth::CLIENT_ID.into();
     config.device_id = device_id.clone();
     let session = Session::new(config, None);
-    dlog::info(format!("session created, client id {}", session.client_id()));
+    dlog::info(format!(
+        "session created: os {}, client id {}, login {login:?}",
+        librespot_core::config::OS,
+        session.client_id()
+    ));
+
+    // 1. Credentials for the access point.
+    let credentials = match login {
+        Login::Password { username, password } => {
+            dlog::info("step 1/4: login5 password login (login5.spotify.com, may solve a hashcash)");
+            match tokio::time::timeout(STEP_TIMEOUT, session.login5().login(username, password)).await {
+                Ok(Ok((token, stored))) => {
+                    dlog::info(format!(
+                        "step 1/4 ok: login5 token (expires in {}s), stored credential {} bytes",
+                        token.expires_in.as_secs(),
+                        stored.len()
+                    ));
+                    Credentials::with_access_token(token.access_token)
+                }
+                Ok(Err(e)) => {
+                    dlog::error(format!("login5 error: {e:?}"));
+                    let (message, _) = login_failure(&e);
+                    let _ = events.send(ended(Some(message), false));
+                    return;
+                }
+                Err(_) => {
+                    let _ = events.send(ended(
+                        Some(format!("Spotify login timed out after {}s.", STEP_TIMEOUT.as_secs())),
+                        false,
+                    ));
+                    return;
+                }
+            }
+        }
+        Login::Stored { username, auth_data } => {
+            dlog::info("step 1/4: using saved stored credential");
+            Credentials {
+                username: Some(username),
+                auth_type: AuthenticationType::AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS,
+                auth_data,
+            }
+        }
+    };
 
     // Listeners must be registered before the dealer starts.
     let dealer = session.dealer();
@@ -183,20 +235,23 @@ pub async fn run(
     };
 
     dlog::info("step 2/4: connecting to Spotify access point (apresolve + login)");
-    match tokio::time::timeout(
-        STEP_TIMEOUT,
-        session.connect(Credentials::with_access_token(tokens.access_token), false),
-    )
-    .await
-    {
-        Ok(Ok(())) => dlog::info(format!(
-            "step 2/4 ok: logged in as {} (country {})",
-            session.username(),
-            session.country()
-        )),
+    match tokio::time::timeout(STEP_TIMEOUT, session.connect(credentials, false)).await {
+        Ok(Ok(())) => {
+            dlog::info(format!(
+                "step 2/4 ok: logged in as {} (country {})",
+                session.username(),
+                session.country()
+            ));
+            // The access point hands back a reusable credential: keep it instead of a password.
+            let auth_data = session.auth_data();
+            if !auth_data.is_empty() {
+                let _ = events.send(Event::Credentials { username: session.username(), auth_data });
+            }
+        }
         Ok(Err(e)) => {
             dlog::error(format!("session.connect error: {e:?}"));
-            let _ = events.send(ended(Some(format!("Spotify login failed ({}).", short(e))), false));
+            let (message, bad_login) = login_failure(&e);
+            let _ = events.send(ended(Some(message), bad_login));
             return;
         }
         Err(_) => {

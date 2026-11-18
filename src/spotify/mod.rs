@@ -1,19 +1,18 @@
 //! Spotify Connect boundary between the dashboard and the experimental librespot backend.
 //!
-//! The UI only depends on [`SpotifyState`], [`Playback`], [`SpotifyCommand`], [`start`] and
-//! [`send`]. The backend (`auth`, `connect`, `session`) signs in with OAuth PKCE, observes the
+//! The UI only depends on [`SpotifyState`], [`Playback`], [`SpotifyCommand`], [`start`],
+//! [`send`] and [`sign_in_with_password`]. The backend (`session`, `connect`) logs in with
+//! librespot's login5 (username/email + password, like Spotify's own iOS app), observes the
 //! account's Spotify Connect devices without becoming a player, and remote-controls the active
 //! device. See `README.md` in this directory.
-use std::{cell::RefCell, rc::Rc};
+use std::cell::RefCell;
 
-use nsh_core::{
-    auth_session::{AuthSessionOutcome, AuthSessionRequest},
-    prelude::*,
-    storage::Storage,
-};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use nsh_core::{prelude::*, storage::Storage};
 use tokio::sync::mpsc;
 
-pub mod auth;
+use crate::debug_log as dlog;
+
 pub mod connect;
 mod session;
 
@@ -22,9 +21,9 @@ mod session;
 pub enum SpotifyState {
     /// The backend is not available in this build, with a short reason for the user.
     Unavailable(String),
-    /// No saved Spotify login; the user can start sign-in.
+    /// No saved Spotify login; the user can sign in.
     SignedOut,
-    /// Device sign-in started: the user enters `code` at `url` on another device.
+    /// Unused by the login5 backend; kept so older UI code still compiles.
     AwaitingApproval { code: String, url: String },
     /// Signing in or connecting to Spotify.
     Connecting,
@@ -54,6 +53,7 @@ pub struct Playback {
 /// User actions sent from the dashboard to the backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpotifyCommand {
+    /// Go back to the sign-in form (sign-in itself is [`sign_in_with_password`]).
     SignIn,
     SignOut,
     PlayPause,
@@ -61,9 +61,12 @@ pub enum SpotifyCommand {
     Previous,
 }
 
-const KEY_REFRESH: &str = "spotify.refresh_token";
+const KEY_USERNAME: &str = "spotify.username";
+/// Spotify's reusable "stored credential" (base64). Never the password.
+const KEY_CREDENTIALS: &str = "spotify.stored_credentials";
 const KEY_DEVICE: &str = "spotify.observer_device_id";
-const CALLBACK_SCHEME: &str = "ihomeview";
+/// Left by the old OAuth backend; removed on start.
+const KEY_OLD_REFRESH: &str = "spotify.refresh_token";
 
 thread_local! {
     /// The running session's request channel (engine thread only).
@@ -71,7 +74,7 @@ thread_local! {
 }
 
 fn observer_device_id() -> String {
-    if let Some(id) = Storage::get_item(KEY_DEVICE).filter(|id| !id.is_empty()) {
+    if let Some(id) = Storage::get_item(KEY_DEVICE).filter(|id| id.len() == 40) {
         return id;
     }
     let id = connect::new_device_id();
@@ -87,18 +90,32 @@ fn stop_session() {
     });
 }
 
-/// Starts a session from the stored refresh token and pumps its events into `state`.
-fn start_session(state: Signal<SpotifyState>, refresh_token: String) {
-    crate::debug_log::info("spotify: starting session from saved login");
+fn forget_login() {
+    Storage::remove_item(KEY_USERNAME);
+    Storage::remove_item(KEY_CREDENTIALS);
+}
+
+fn saved_login() -> Option<(String, Vec<u8>)> {
+    let username = Storage::get_item(KEY_USERNAME).filter(|u| !u.is_empty())?;
+    let data = Storage::get_item(KEY_CREDENTIALS).and_then(|c| BASE64.decode(c).ok())?;
+    (!data.is_empty()).then_some((username, data))
+}
+
+/// Starts a session and pumps its events into `state`.
+///
+/// The librespot work runs on NSH's tokio runtime. `background` (a `tokio::spawn`) needs the
+/// runtime's context, which press handlers do not have, so it is called from inside an engine
+/// task (tasks are polled in the runtime's context).
+fn start_session(state: Signal<SpotifyState>, login: session::Login) {
     stop_session();
     state.set(SpotifyState::Connecting);
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (request_tx, request_rx) = mpsc::unbounded_channel();
     SESSION.with(|s| *s.borrow_mut() = Some(request_tx.clone()));
     let device_id = observer_device_id();
-    background(session::run(refresh_token, device_id, event_tx, request_rx));
 
     spawn(async move {
+        let _worker = background(session::run(login, device_id, event_tx, request_rx));
         while let Some(event) = event_rx.recv().await {
             // Ignore events from a session that has since been replaced or stopped.
             let current = SESSION.with(|s| s.borrow().as_ref().is_some_and(|tx| tx.same_channel(&request_tx)));
@@ -106,28 +123,28 @@ fn start_session(state: Signal<SpotifyState>, refresh_token: String) {
                 break;
             }
             match event {
-                session::Event::RefreshToken(token) => {
-                    let _ = Storage::set_item(KEY_REFRESH, token);
+                session::Event::Credentials { username, auth_data } => {
+                    dlog::info(format!("spotify: saving stored credential for '{username}'"));
+                    let _ = Storage::set_item(KEY_USERNAME, username);
+                    let _ = Storage::set_item(KEY_CREDENTIALS, BASE64.encode(auth_data));
                 }
                 session::Event::Playback(playback) => {
                     if !matches!(state.get_untracked(), SpotifyState::Connected(_)) {
-                        crate::debug_log::info("spotify: connected");
+                        dlog::info("spotify: connected");
                     }
-                    state.set(SpotifyState::Connected(playback))
+                    state.set(SpotifyState::Connected(playback));
                 }
                 session::Event::Error(message) => {
-                    crate::debug_log::warn(format!("spotify: {message}"));
+                    dlog::warn(format!("spotify: {message}"));
                     // Keep showing playback; surface command errors without dropping the session.
                     if !matches!(state.get_untracked(), SpotifyState::Connected(_)) {
                         state.set(SpotifyState::Error(message));
-                    } else {
-                        log::warn!("spotify: {message}");
                     }
                 }
                 session::Event::Ended { message, signed_out } => {
                     SESSION.with(|s| *s.borrow_mut() = None);
                     if signed_out {
-                        Storage::remove_item(KEY_REFRESH);
+                        forget_login();
                     }
                     state.set(match message {
                         Some(m) => SpotifyState::Error(m),
@@ -140,79 +157,26 @@ fn start_session(state: Signal<SpotifyState>, refresh_token: String) {
     });
 }
 
-/// Runs the OAuth sign-in: loopback listener + Spotify's page in an auth session.
-fn sign_in(state: Signal<SpotifyState>) {
-    crate::debug_log::info("sign-in: starting (loopback 127.0.0.1:8898 + auth session)");
-    stop_session();
-    state.set(SpotifyState::Connecting);
-    let pkce = auth::Pkce::new();
-    let url = pkce.authorize_url();
-    let finished = Rc::new(RefCell::new(false));
-
-    // The listener runs on the runtime threads; the page in an ASWebAuthenticationSession.
-    let listener_pkce = pkce.clone();
-    let token_task = background(async move {
-        let listener = auth::bind_listener().await?;
-        crate::debug_log::info("sign-in: listener bound, waiting for redirect");
-        let code = auth::wait_for_code(listener, &listener_pkce.state).await?;
-        crate::debug_log::info("sign-in: redirect received, exchanging code");
-        auth::exchange_code(&code, &listener_pkce).await
-    });
-
-    let done = finished.clone();
-    spawn(async move {
-        let result = match token_task.await {
-            Ok(result) => result,
-            Err(_) => Err(auth::AuthError::Listener("task stopped".into())),
-        };
-        *done.borrow_mut() = true;
-        close_auth_session();
-        match &result {
-            Ok(t) => crate::debug_log::info(format!(
-                "sign-in: token ok (refresh token: {})",
-                t.refresh_token.as_deref().is_some_and(|r| !r.is_empty())
-            )),
-            Err(e) => crate::debug_log::error(format!("sign-in failed: {e:?}")),
-        }
-        match result {
-            Ok(tokens) => match tokens.refresh_token.filter(|t| !t.is_empty()) {
-                Some(refresh) => {
-                    let _ = Storage::set_item(KEY_REFRESH, refresh.clone());
-                    start_session(state, refresh);
-                }
-                None => state.set(SpotifyState::Error("Spotify did not return a login token.".into())),
-            },
-            Err(auth::AuthError::Denied(e)) if e == "access_denied" => state.set(SpotifyState::SignedOut),
-            Err(e) => state.set(SpotifyState::Error(e.to_string())),
-        }
-    });
-
-    let page = open_auth_session(AuthSessionRequest::new(url, CALLBACK_SCHEME));
-    spawn(async move {
-        let outcome = page.await;
-        crate::debug_log::info(format!("sign-in: auth page closed: {outcome:?}"));
-        if *finished.borrow() {
-            return;
-        }
-        // The page closed without the redirect reaching the app.
-        let cancelled = matches!(outcome, Ok(AuthSessionOutcome::Cancelled));
-        // Give the listener a moment in case the redirect is still arriving.
-        timer(std::time::Duration::from_millis(800)).await;
-        if *finished.borrow() {
-            return;
-        }
-        state.set(if cancelled {
-            SpotifyState::SignedOut
-        } else {
-            SpotifyState::Error("Could not open the Spotify sign-in page.".into())
-        });
-    });
+/// Signs in with a Spotify username/email and password through login5. The password is only
+/// sent to Spotify; the app keeps Spotify's stored credential instead.
+pub fn sign_in_with_password(state: Signal<SpotifyState>, username: String, password: String) {
+    let username = username.trim().to_owned();
+    if username.is_empty() || password.is_empty() {
+        state.set(SpotifyState::Error("Enter your Spotify email or username and password.".into()));
+        return;
+    }
+    dlog::info(format!("sign-in: login5 password login for '{username}'"));
+    start_session(state, session::Login::Password { username, password });
 }
 
 /// Starts the backend once for the dashboard, restoring a saved login when one exists.
 pub fn start(state: Signal<SpotifyState>) {
-    match Storage::get_item(KEY_REFRESH).filter(|t| !t.is_empty()) {
-        Some(token) => start_session(state, token),
+    Storage::remove_item(KEY_OLD_REFRESH);
+    match saved_login() {
+        Some((username, auth_data)) => {
+            dlog::info(format!("spotify: restoring saved login for '{username}'"));
+            start_session(state, session::Login::Stored { username, auth_data });
+        }
         None => state.set(SpotifyState::SignedOut),
     }
 }
@@ -220,10 +184,14 @@ pub fn start(state: Signal<SpotifyState>) {
 /// Sends a user action to the backend.
 pub fn send(state: Signal<SpotifyState>, command: SpotifyCommand) {
     match command {
-        SpotifyCommand::SignIn => sign_in(state),
-        SpotifyCommand::SignOut => {
+        SpotifyCommand::SignIn => {
             stop_session();
-            Storage::remove_item(KEY_REFRESH);
+            state.set(SpotifyState::SignedOut);
+        }
+        SpotifyCommand::SignOut => {
+            dlog::info("spotify: sign out");
+            stop_session();
+            forget_login();
             state.set(SpotifyState::SignedOut);
         }
         SpotifyCommand::PlayPause | SpotifyCommand::Next | SpotifyCommand::Previous => {
