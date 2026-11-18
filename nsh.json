@@ -12,8 +12,6 @@
       "MinimumOSVersion": "15.0",
       "UIRequiredDeviceCapabilities": ["arm64"],
       "UIDeviceFamily": [2],
-      "UIStatusBarHidden": true,
-      "UIViewControllerBasedStatusBarAppearance": false,
       "LSApplicationQueriesSchemes": ["spotify"]
     }
   }
