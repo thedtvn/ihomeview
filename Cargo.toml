@@ -1,0 +1,20 @@
+[package]
+name = "ihomeview"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+nsh-core = "=0.6.0"
+nsh-base = "=0.6.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+nsh-engine = "=0.6.0"
+nsh-testing = "=0.6.0"
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"

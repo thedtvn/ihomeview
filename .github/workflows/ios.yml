@@ -1,0 +1,59 @@
+name: Native iPad IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      NSH_VERSION: v0.6.0
+      IPHONEOS_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check build tools
+        run: |
+          uname -m
+          xcodebuild -version
+          rustc --version
+          cargo --version
+      - name: Install pinned Native Shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          case "$arch" in arm64) ;; *) echo 'NSH iOS distribution requires Apple Silicon'; exit 1 ;; esac
+          archive=nsh-macos-arm64.tar.gz
+          base="https://github.com/longbridge/nsh/releases/download/$NSH_VERSION"
+          mkdir -p "$RUNNER_TEMP/nsh"
+          cd "$RUNNER_TEMP/nsh"
+          curl --fail --location --retry 2 "$base/$archive" -o "$archive"
+          curl --fail --location --retry 2 "$base/$archive.sha256" -o "$archive.sha256"
+          shasum -a 256 -c "$archive.sha256"
+          tar -xzf "$archive"
+          cli=$(find "$PWD" -type f -path '*/bin/nsh' -print -quit)
+          test -n "$cli"
+          echo "$(dirname "$cli")" >> "$GITHUB_PATH"
+          "$cli" --version
+      - name: Test native app and packager
+        run: |
+          cargo test --locked --lib
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Package unsigned device IPA
+        run: bash scripts/build-ios.sh
+      - name: Upload TrollStore artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ihomeview-ipad-arm64
+          path: |
+            artifacts/ihomeview.ipa
+            artifacts/ihomeview.ipa.sha256
+            artifacts/ihomeview.build.json
+          if-no-files-found: error
+          retention-days: 14

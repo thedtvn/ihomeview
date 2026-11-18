@@ -1,0 +1,16 @@
+/target/
+/.nsh/
+/.tools/
+/artifacts/
+/build/
+*.ipa
+*.mobileprovision
+.env
+.env.*
+!.env.example
+*.p12
+*.p8
+*.key
+.DS_Store
+__pycache__/
+*.pyc

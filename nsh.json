@@ -1,0 +1,17 @@
+{
+  "name": "ihomeview",
+  "id": "io.github.thedtvn.ihomeview",
+  "version": "0.1.0",
+  "build": 1,
+  "rust": ".",
+  "root": "App",
+  "appearance": "dark",
+  "ios": {
+    "infoPlist": {
+      "MinimumOSVersion": "15.0",
+      "UIRequiredDeviceCapabilities": ["arm64"],
+      "UIDeviceFamily": [2],
+      "LSApplicationQueriesSchemes": ["spotify"]
+    }
+  }
+}
