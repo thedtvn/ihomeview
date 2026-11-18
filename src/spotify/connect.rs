@@ -13,7 +13,7 @@
 //! against live Spotify until tested with a real account (see `README.md`).
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use librespot_protocol::{
+use librespot::protocol::{
     connect::{
         Capabilities, Cluster, Device, DeviceInfo, MemberType, PutStateReason, PutStateRequest,
     },
@@ -55,8 +55,8 @@ pub fn observer_request(device_id: &str, client_id: &str, session_id: &str) -> P
         name: OBSERVER_NAME.into(),
         device_id: device_id.into(),
         device_type: EnumOrUnknown::new(DeviceType::TABLET),
-        device_software_version: librespot_core::version::SEMVER.into(),
-        spirc_version: librespot_core::version::SPOTIFY_SPIRC_VERSION.into(),
+        device_software_version: librespot::core::version::SEMVER.into(),
+        spirc_version: librespot::core::version::SPOTIFY_SPIRC_VERSION.into(),
         client_id: client_id.into(),
         capabilities: MessageField::some(capabilities),
         ..Default::default()
@@ -218,7 +218,7 @@ pub fn command_path(from: &str, to: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use librespot_protocol::player::ProvidedTrack;
+    use librespot::protocol::player::ProvidedTrack;
     use protobuf::Message;
 
     fn cluster(active: &str, playing: bool) -> Cluster {

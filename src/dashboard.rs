@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use chrono::{Datelike, Local, Timelike};
 use nsh_base::theme;
-use nsh_core::{AutoFill, Checked, element::input, prelude::*, time::unix_ms};
+use nsh_core::{Checked, prelude::*, time::unix_ms};
 
 use crate::spotify::{self, Playback, SpotifyCommand, SpotifyState};
 
@@ -47,6 +47,9 @@ const WHEEL_W_PT: f32 = 52.0;
 const WHEEL_LABEL_W_PT: f32 = 46.0;
 /// Width of the timer panel (and of the header column above it) in landscape.
 const PANEL_W_PT: f32 = 360.0;
+/// Wheel fling deceleration: velocity kept per millisecond. 0.998 is UIKit's "normal" (a flick
+/// at 2 pt/ms coasts about a thousand points); 0.99 is "fast" and stops a fling within a few rows.
+const WHEEL_DECELERATION: f32 = 0.998;
 /// The timer panel's own background (CARD over the page), so the wheels can fade into it.
 const PANEL_BG: u32 = 0x171719ff;
 /// Alarm tone: pitch (Hz), one beep's length (s) and the whole clip's length (s).
@@ -302,7 +305,19 @@ pub fn Dashboard() -> impl IntoElement {
         .bg(AdaptiveColor::rgb(0x0b0b0d, 0x0b0b0d))
         .test_id("dashboard_root")
         .child(
-            scroll().flex_1().child(
+            scroll()
+                .test_id("dashboard_scroll")
+                .flex_1()
+                // The page itself never moves under normal touches: no rubber band, and in
+                // landscape (where everything fits on one screen) no scrolling at all. The one
+                // exception is the on-screen keyboard: NSH then gives this scroll view a bottom
+                // inset as tall as the keyboard and scrolls the focused field into view, which
+                // keeps the Spotify login fields clear of the keyboard. Portrait may scroll when
+                // its content is taller than the screen.
+                .bounces(false)
+                .scrollbar(false)
+                .scrollable(move || !is_landscape() || keyboard_height().0 > 0.0)
+                .child(
                 view()
                     .p(px(24.0))
                     .gap(px(20.0))
@@ -695,9 +710,14 @@ fn time_unit(unit: TimeUnit, duration_secs: Signal<i64>, remaining_secs: Signal<
 }
 
 /// A vertical scroll view of numbers `0..=max`, one row tall each, with two empty rows of room
-/// above and below, so scrolling to `value * row` puts that value in the middle row. The native
-/// scroll view does the snapping; we read the row it rests on, and scroll it when the value
-/// changes from outside (a preset).
+/// above and below, so scrolling to `value * row` puts that value in the middle row.
+///
+/// Feel: the native scroll view does all the work while the finger is on it and while it glides
+/// (flick momentum with the normal iOS deceleration, then a snap onto a row). Nothing of ours
+/// runs per frame: the fade of the rows follows the scroll offset natively (`scroll_value` +
+/// `interpolate`), and the time is only written when the wheel comes to rest. We scroll the wheel
+/// ourselves only when the time changed from outside (a preset, VoiceOver), never in answer to
+/// the wheel's own movement.
 fn time_wheel(unit: TimeUnit, duration_secs: Signal<i64>, remaining_secs: Signal<i64>) -> impl IntoElement {
     let (test_id, name) = match unit {
         TimeUnit::Hours => ("timer_hours", "Hours"),
@@ -707,17 +727,16 @@ fn time_wheel(unit: TimeUnit, duration_secs: Signal<i64>, remaining_secs: Signal
     let value = computed(move || unit.part(remaining_secs.get()));
     let initial = unit.part(remaining_secs.get_untracked());
     let wheel = element_ref();
-    // The row the wheel is at (or is being scrolled to by us), so we only scroll it when the
-    // value changed from outside.
+    // The row the wheel rests on (or that we sent it to). The time only differs from it when it
+    // was changed from outside, and only then do we scroll the wheel.
     let shown = stored(initial);
-    // Set while we scroll the wheel ourselves: its scroll events are not the user's.
-    let pending = stored(None::<i64>);
+    // The scroll offset, followed natively by the rows' fade.
+    let offset = animated_value(initial as f32 * WHEEL_ROW_PT);
 
     effect(move || {
         let v = value.get();
         if v != shown.get() {
             shown.replace(v);
-            pending.replace(Some(v));
             wheel.scroll_to(point(px(0.0), px(v as f32 * WHEEL_ROW_PT)), true);
         }
     });
@@ -730,15 +749,9 @@ fn time_wheel(unit: TimeUnit, duration_secs: Signal<i64>, remaining_secs: Signal
             remaining_secs.set(total);
         }
     };
-    // The wheel reached `offset_y`: the row there is the new value.
-    let settle = move |offset_y: f32| {
+    // The wheel came to rest at `offset_y`: the row there is the new time.
+    let commit = move |offset_y: f32| {
         let idx = ((offset_y / WHEEL_ROW_PT).round() as i64).clamp(0, unit.max());
-        if let Some(target) = pending.get() {
-            if idx == target {
-                pending.replace(None);
-            }
-            return;
-        }
         if idx != shown.get() {
             shown.replace(idx);
             set_unit(idx);
@@ -746,25 +759,25 @@ fn time_wheel(unit: TimeUnit, duration_secs: Signal<i64>, remaining_secs: Signal
     };
 
     let rows = (0..=unit.max()).map(move |i| {
+        // Full strength when this row is in the band, fading to a faint number three rows away.
+        let at = |k: f32| (i as f32 + k) * WHEEL_ROW_PT;
+        let fade = offset.interpolate(
+            &[at(-3.0), at(-2.0), at(-1.0), at(0.0), at(1.0), at(2.0), at(3.0)],
+            &[0.15, 0.28, 0.55, 1.0, 0.55, 0.28, 0.15],
+        );
         view()
             .w_full()
             .h(px(WHEEL_ROW_PT))
             .items_end()
             .justify_center()
             .pr(px(8.0))
+            .bind_opacity(&fade)
             .child(
                 text(i.to_string())
                     .text_size(px(30.0))
                     .font_weight(FontWeight::MEDIUM)
                     .tabular_nums()
-                    .text_color(move || {
-                        rgba(match (value.get() - i).abs() {
-                            0 => 0xffffffff,
-                            1 => 0xffffff8c,
-                            2 => 0xffffff47,
-                            _ => 0xffffff26,
-                        })
-                    }),
+                    .text_color(white()),
             )
     });
 
@@ -773,17 +786,19 @@ fn time_wheel(unit: TimeUnit, duration_secs: Signal<i64>, remaining_secs: Signal
         .w(px(WHEEL_W_PT))
         .h(px(WHEEL_ROW_PT * WHEEL_ROWS))
         .scrollbar(false)
-        .bounces(false)
+        // Like a real picker: a hard flick may overshoot the first or last number a little.
+        .bounces(true)
         .snap_interval(px(WHEEL_ROW_PT))
         .snap_alignment(SnapAlignment::Start)
-        .deceleration(0.99_f32)
+        // Normal iOS deceleration, so a flick coasts over many rows before it settles on one.
+        .deceleration(WHEEL_DECELERATION)
         .content_offset(point(px(0.0), px(initial as f32 * WHEEL_ROW_PT)))
         .element_ref(&wheel)
-        .on_scroll_drag_start(move |_: &Point<Points>| {
-            pending.replace(None);
-        })
-        .on_scroll(move |e: &ScrollEvent| settle(e.offset.y.0))
-        .on_scroll_end(move |at: &Point<Points>| settle(at.y.0))
+        .scroll_value(&offset)
+        // Rest after a fling, or after a drag that did not fling. (A new touch that catches a
+        // glide ends it with a momentum end, so that is covered too.)
+        .on_scroll_end(move |at: &Point<Points>| commit(at.y.0))
+        .on_momentum_end(move |at: &Point<Points>| commit(at.y.0))
         // One element for screen readers: "Hours: 2", adjustable with swipes up and down.
         .accessible(true)
         .role(AccessibilityRole::Adjustable)
@@ -1171,84 +1186,17 @@ fn unavailable_view(reason: Memo<String>) -> impl IntoElement {
         .child(state_note(move || reason.get()).text_center().max_w(px(560.0)))
 }
 
-fn login_field(test_id: &'static str, placeholder: &'static str, value: Signal<String>) -> Input {
-    input()
-        .test_id(test_id)
-        .label(placeholder)
-        .placeholder(placeholder)
-        .value(move || value.get())
-        .on_change(move |text: &str| value.set(text.to_owned()))
-        .auto_capitalize(AutoCapitalize::None)
-        .auto_correct(false)
-        .keyboard_appearance(KeyboardAppearance::Dark)
-        .w(px(420.0))
-        .min_h(px(56.0))
-        .px(px(18.0))
-        .rounded(px(14.0))
-        .border_1()
-        .border_color(rgba(0xffffff33))
-        .bg(rgba(0xffffff0f))
-        .text_size(px(20.0))
-        .text_color(white())
-        .placeholder_color(rgba(FAINT))
-}
-
-/// In-app Spotify login (login5). The password goes only to Spotify; the app keeps Spotify's
-/// stored credential.
 fn signed_out_view(spotify_state: Signal<SpotifyState>) -> impl IntoElement {
-    let username = signal(String::new());
-    let password = signal(String::new());
-    let submit = move || {
-        let pw = password.get_untracked();
-        password.set(String::new());
-        spotify::sign_in_with_password(spotify_state, username.get_untracked(), pw);
-    };
     state_column("spotify_signed_out")
-        .gap(px(14.0))
         .child(state_title("Control Spotify here"))
-        .child(state_note("Sign in with your Spotify account to play, pause and skip."))
-        .child(
-            login_field("spotify_username", "Email or username", username)
-                .keyboard_type(KeyboardType::Email)
-                .auto_fill(AutoFill::Username)
-                .return_key_type(ReturnKeyType::Next),
-        )
-        .child(
-            login_field("spotify_password", "Password", password)
-                .masked(true)
-                .auto_fill(AutoFill::Password)
-                .return_key_type(ReturnKeyType::Go)
-                .on_submit(move |_: &str| submit()),
-        )
-        .child(
-            view()
-                .role(AccessibilityRole::Button)
-                .test_id("spotify_sign_in")
-                .label("Sign in to Spotify")
-                .disabled(move || username.get().trim().is_empty() || password.get().is_empty())
-                .opacity(move || {
-                    if username.get().trim().is_empty() || password.get().is_empty() { 0.5_f32 } else { 1.0 }
-                })
-                .on_press(move || submit())
-                .min_h(px(60.0))
-                .w(px(420.0))
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .bg(rgba(GREEN))
-                .active(|s| s.opacity(0.75))
-                .child(
-                    text("Sign in to Spotify")
-                        .text_size(px(22.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgba(ON_GREEN)),
-                ),
-        )
-        .child(
-            text("Your password is sent only to Spotify and is not saved on this iPad.")
-                .text_size(px(14.0))
-                .text_color(rgba(FAINT)),
-        )
+        .child(state_note("Sign in once on Spotify's page to play, pause and skip."))
+        .child(music_button(
+            spotify_state,
+            SpotifyCommand::SignIn,
+            "spotify_sign_in",
+            "Sign in to Spotify",
+            true,
+        ))
 }
 
 fn awaiting_view(
@@ -1992,37 +1940,31 @@ mod tests {
     }
 
     #[test]
-    fn music_signed_out_offers_login_form() {
+    fn music_signed_out_offers_sign_in() {
         let mut app = Headless::start(landscape_config(Root::of::<ProbeSignedOut>())).unwrap();
         app.wait_for("id:spotify_signed_out").unwrap();
-        app.wait_for("id:spotify_username").unwrap();
-        app.wait_for("id:spotify_password").unwrap();
-        // Disabled until both fields are filled.
-        assert!(!app.screen().enabled("id:spotify_sign_in").unwrap());
-        app.type_text("id:spotify_username", "someone@example.com").unwrap();
-        assert!(!app.screen().enabled("id:spotify_sign_in").unwrap());
-        app.type_text("id:spotify_password", "pw").unwrap();
+        app.wait_for("Sign in to Spotify").unwrap();
         assert!(app.screen().enabled("id:spotify_sign_in").unwrap());
+        assert_eq!(app.screen().count("id:spotify_password").unwrap(), 0);
     }
 
-    /// Regression: signing in disposes the form, which used to cancel the session task before it
-    /// ran, leaving "Connecting to Spotify…" forever.
+    /// Regression: the sign-in button is disposed as soon as the state becomes `Connecting`;
+    /// the sign-in task must outlive it (it used to be cancelled before it ran).
     #[test]
-    fn sign_in_starts_the_session_task_after_the_form_is_gone() {
+    fn sign_in_task_outlives_the_button() {
         let mut app = start_landscape();
-        app.wait_for("id:spotify_username").unwrap();
-        app.type_text("id:spotify_username", "regression@example.invalid").unwrap();
-        app.type_text("id:spotify_password", "pw").unwrap();
+        app.wait_for("id:spotify_sign_in").unwrap();
         app.press("id:spotify_sign_in").unwrap();
-        // Off iOS, librespot refuses login5 at once, so the state moves on to an error quickly.
         let started = (0..50).any(|_| {
-            if crate::debug_log::text().contains("spotify: session task started") {
+            if crate::debug_log::text().contains("sign-in: listener bound")
+                || crate::debug_log::text().contains("sign-in failed")
+            {
                 return true;
             }
             let _ = app.wait_for_gone("id:never_there", Duration::from_millis(40));
             false
         });
-        assert!(started, "session task never ran:\n{}", crate::debug_log::text());
+        assert!(started, "sign-in task never ran:\n{}", crate::debug_log::text());
     }
 
     #[test]
@@ -2080,6 +2022,32 @@ mod tests {
         app.wait_for("id:spotify_idle").unwrap();
         app.wait_for("Nothing playing").unwrap();
         assert_eq!(app.screen().count("id:spotify_title").unwrap(), 0);
+    }
+
+    #[test]
+    fn landscape_dashboard_does_not_move_under_touches() {
+        let mut app = start_landscape();
+        app.wait_for("id:clock_time").unwrap();
+        app.wait_for("id:dashboard_scroll").unwrap();
+        // The page is not user-scrollable in landscape (no keyboard up), so dragging it fails.
+        let err = app.scroll("id:dashboard_scroll", px(200.0)).unwrap_err();
+        eprintln!("expected refusal: {err}");
+        // A finger drag across the clock leaves everything where it was.
+        let before = app.screen().layout_nodes();
+        let top = |nodes: &[nsh_testing::LayoutNode]| {
+            nodes
+                .iter()
+                .find(|n| n.test_id.as_deref() == Some("clock_time"))
+                .unwrap()
+                .bounds
+                .origin
+                .y
+                .0
+        };
+        let y0 = top(&before);
+        app.drag("id:clock_time", nsh_core::geometry::point(px(0.0), px(-150.0))).unwrap();
+        let after = app.screen().layout_nodes();
+        assert_eq!(y0, top(&after), "the dashboard moved under a drag");
     }
 
     #[test]

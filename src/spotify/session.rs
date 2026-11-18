@@ -5,10 +5,10 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use librespot_core::{
+use librespot::core::{
     Session, SessionConfig, SpotifyUri, authentication::Credentials, dealer::protocol::Message,
 };
-use librespot_protocol::{
+use librespot::protocol::{
     authentication::AuthenticationType,
     connect::{Cluster, ClusterUpdate},
     metadata::Track,
@@ -26,8 +26,8 @@ use super::{
 
 /// How the session logs in.
 pub enum Login {
-    /// First sign-in: login5 with username/email + password (the password is never stored).
-    Password { username: String, password: String },
+    /// First sign-in: an OAuth access token from Spotify's login page (keymaster client).
+    Token(String),
     /// Later launches: Spotify's reusable stored credential from an earlier login.
     Stored { username: String, auth_data: Vec<u8> },
 }
@@ -35,7 +35,7 @@ pub enum Login {
 impl std::fmt::Debug for Login {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Login::Password { username, .. } => write!(f, "Password({username}, <hidden>)"),
+            Login::Token(_) => f.write_str("OAuthToken(<hidden>)"),
             Login::Stored { username, auth_data } => write!(f, "Stored({username}, {} bytes)", auth_data.len()),
         }
     }
@@ -136,7 +136,7 @@ async fn send_command(session: &Session, own_id: &str, target: &str, cmd: Remote
 }
 
 /// A short, user-facing message for a login failure, and whether the saved login is unusable.
-fn login_failure(err: &librespot_core::Error) -> (String, bool) {
+fn login_failure(err: &librespot::core::Error) -> (String, bool) {
     let text = format!("{err}");
     if text.contains("INVALID_CREDENTIALS") || text.contains("BadCredentials") || text.contains("UNKNOWN_IDENTIFIER") {
         ("Wrong Spotify email/username or password.".into(), true)
@@ -167,44 +167,22 @@ pub async fn run(
         Event::Ended { message, signed_out }
     };
 
-    // Session with librespot's default client id for this OS (the iOS client on the iPad, which
-    // login5 password login requires) and our persisted observer id.
+    // Session with librespot's default client id. On iOS the fantasybot-red fork identifies as
+    // macOS, so this is the desktop (keymaster) client the OAuth token was issued to.
     let mut config = SessionConfig::default();
     config.device_id = device_id.clone();
     let session = Session::new(config, None);
     dlog::info(format!(
         "session created: os {}, client id {}, login {login:?}",
-        librespot_core::config::OS,
+        librespot::core::config::OS,
         session.client_id()
     ));
 
     // 1. Credentials for the access point.
     let credentials = match login {
-        Login::Password { username, password } => {
-            dlog::info("step 1/4: login5 password login (login5.spotify.com, may solve a hashcash)");
-            match tokio::time::timeout(STEP_TIMEOUT, session.login5().login(username, password)).await {
-                Ok(Ok((token, stored))) => {
-                    dlog::info(format!(
-                        "step 1/4 ok: login5 token (expires in {}s), stored credential {} bytes",
-                        token.expires_in.as_secs(),
-                        stored.len()
-                    ));
-                    Credentials::with_access_token(token.access_token)
-                }
-                Ok(Err(e)) => {
-                    dlog::error(format!("login5 error: {e:?}"));
-                    let (message, _) = login_failure(&e);
-                    let _ = events.send(ended(Some(message), false));
-                    return;
-                }
-                Err(_) => {
-                    let _ = events.send(ended(
-                        Some(format!("Spotify login timed out after {}s.", STEP_TIMEOUT.as_secs())),
-                        false,
-                    ));
-                    return;
-                }
-            }
+        Login::Token(token) => {
+            dlog::info("step 1/4: using OAuth access token from Spotify's login page");
+            Credentials::with_access_token(token)
         }
         Login::Stored { username, auth_data } => {
             dlog::info("step 1/4: using saved stored credential");
@@ -222,7 +200,7 @@ pub async fn run(
         m.headers
             .get("Spotify-Connection-Id")
             .cloned()
-            .ok_or_else(|| librespot_core::Error::failed_precondition("missing connection id"))
+            .ok_or_else(|| librespot::core::Error::failed_precondition("missing connection id"))
     });
     let cluster_updates =
         dealer.listen_for("hm://connect-state/v1/cluster", Message::from_raw::<ClusterUpdate>);
