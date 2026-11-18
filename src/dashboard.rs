@@ -1223,13 +1223,46 @@ fn awaiting_view(
                 .letter_spacing(px(10.0))
                 .text_color(rgba(GREEN)),
         )
-        .child(music_button(
-            spotify_state,
-            SpotifyCommand::SignOut,
-            "spotify_cancel",
-            "Cancel",
-            false,
-        ))
+        .child(
+            view()
+                .flex_row()
+                .gap(px(14.0))
+                .child(
+                    view()
+                        .role(AccessibilityRole::Button)
+                        .test_id("spotify_open_pair")
+                        .label("Open in Safari")
+                        .hint("Opens the Spotify pairing page with the code filled in")
+                        .on_press(move || {
+                            let code = approval.get_untracked().0;
+                            let url = format!("https://spotify.com/pair?code={code}");
+                            crate::debug_log::info(format!("sign-in: opening {url} in Safari"));
+                            // Pairing keeps polling while Safari is in front; come back after approving.
+                            let _ = open_url(url);
+                        })
+                        .min_h(px(60.0))
+                        .min_w(px(120.0))
+                        .px(px(28.0))
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(rgba(GREEN))
+                        .active(|s| s.opacity(0.75))
+                        .child(
+                            text("Open in Safari")
+                                .text_size(px(22.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgba(ON_GREEN)),
+                        ),
+                )
+                .child(music_button(
+                    spotify_state,
+                    SpotifyCommand::SignOut,
+                    "spotify_cancel",
+                    "Cancel",
+                    false,
+                )),
+        )
 }
 
 fn connecting_view() -> impl IntoElement {
@@ -1973,6 +2006,9 @@ mod tests {
         app.wait_for("id:spotify_awaiting").unwrap();
         app.wait_for("ABCD-1234").unwrap();
         app.wait_for("spotify.com/pair").unwrap();
+        app.wait_for("Open in Safari").unwrap();
+        app.press("id:spotify_open_pair").unwrap();
+        assert!(crate::debug_log::text().contains("https://spotify.com/pair?code=ABCD-1234"));
         app.press("id:spotify_cancel").unwrap();
     }
 
