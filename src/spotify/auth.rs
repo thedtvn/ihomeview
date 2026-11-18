@@ -183,14 +183,23 @@ fn default_expiry() -> u64 {
 }
 
 async fn token_request(form: &[(&str, &str)]) -> Result<Tokens, AuthError> {
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| AuthError::Exchange(e.to_string()))?;
+    let response = client
         .post(TOKEN_URL)
         .form(form)
         .send()
         .await
-        .map_err(|e| AuthError::Exchange(e.without_url().to_string()))?;
+        .map_err(|e| {
+            let e = e.without_url();
+            crate::debug_log::error(format!("token request: {e:?}"));
+            AuthError::Exchange(e.to_string())
+        })?;
     let status = response.status();
     if !status.is_success() {
+        crate::debug_log::error(format!("token request: HTTP {}", status.as_u16()));
         // Never include the body: it may echo request data.
         return Err(AuthError::Exchange(format!("HTTP {}", status.as_u16())));
     }

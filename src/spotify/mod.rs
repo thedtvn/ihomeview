@@ -89,6 +89,7 @@ fn stop_session() {
 
 /// Starts a session from the stored refresh token and pumps its events into `state`.
 fn start_session(state: Signal<SpotifyState>, refresh_token: String) {
+    crate::debug_log::info("spotify: starting session from saved login");
     stop_session();
     state.set(SpotifyState::Connecting);
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -108,8 +109,14 @@ fn start_session(state: Signal<SpotifyState>, refresh_token: String) {
                 session::Event::RefreshToken(token) => {
                     let _ = Storage::set_item(KEY_REFRESH, token);
                 }
-                session::Event::Playback(playback) => state.set(SpotifyState::Connected(playback)),
+                session::Event::Playback(playback) => {
+                    if !matches!(state.get_untracked(), SpotifyState::Connected(_)) {
+                        crate::debug_log::info("spotify: connected");
+                    }
+                    state.set(SpotifyState::Connected(playback))
+                }
                 session::Event::Error(message) => {
+                    crate::debug_log::warn(format!("spotify: {message}"));
                     // Keep showing playback; surface command errors without dropping the session.
                     if !matches!(state.get_untracked(), SpotifyState::Connected(_)) {
                         state.set(SpotifyState::Error(message));
@@ -135,6 +142,7 @@ fn start_session(state: Signal<SpotifyState>, refresh_token: String) {
 
 /// Runs the OAuth sign-in: loopback listener + Spotify's page in an auth session.
 fn sign_in(state: Signal<SpotifyState>) {
+    crate::debug_log::info("sign-in: starting (loopback 127.0.0.1:8898 + auth session)");
     stop_session();
     state.set(SpotifyState::Connecting);
     let pkce = auth::Pkce::new();
@@ -145,7 +153,9 @@ fn sign_in(state: Signal<SpotifyState>) {
     let listener_pkce = pkce.clone();
     let token_task = background(async move {
         let listener = auth::bind_listener().await?;
+        crate::debug_log::info("sign-in: listener bound, waiting for redirect");
         let code = auth::wait_for_code(listener, &listener_pkce.state).await?;
+        crate::debug_log::info("sign-in: redirect received, exchanging code");
         auth::exchange_code(&code, &listener_pkce).await
     });
 
@@ -157,6 +167,13 @@ fn sign_in(state: Signal<SpotifyState>) {
         };
         *done.borrow_mut() = true;
         close_auth_session();
+        match &result {
+            Ok(t) => crate::debug_log::info(format!(
+                "sign-in: token ok (refresh token: {})",
+                t.refresh_token.as_deref().is_some_and(|r| !r.is_empty())
+            )),
+            Err(e) => crate::debug_log::error(format!("sign-in failed: {e:?}")),
+        }
         match result {
             Ok(tokens) => match tokens.refresh_token.filter(|t| !t.is_empty()) {
                 Some(refresh) => {
@@ -173,6 +190,7 @@ fn sign_in(state: Signal<SpotifyState>) {
     let page = open_auth_session(AuthSessionRequest::new(url, CALLBACK_SCHEME));
     spawn(async move {
         let outcome = page.await;
+        crate::debug_log::info(format!("sign-in: auth page closed: {outcome:?}"));
         if *finished.borrow() {
             return;
         }

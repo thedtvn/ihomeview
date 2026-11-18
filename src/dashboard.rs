@@ -2,9 +2,9 @@
 //!
 //! A desk display for a landscape iPad (1024x768 first, portrait still works):
 //!
-//! * a big clock and date, with 12h/24h, Dim and a Timer button;
+//! * a big clock and date, with 12h/24h, Dim and a Timer button; holding the clock opens the
+//!   debug log;
 //! * a Music card that fills the screen and follows [`crate::spotify::SpotifyState`];
-//! * a compact Camera tile ("Not configured");
 //! * a focus timer that is hidden until it is needed: a header button opens it, a running
 //!   timer stays visible as a small countdown in the header, and finishing or resetting hides it.
 //!
@@ -34,7 +34,11 @@ const PRESET_LABELS: [&str; 4] = [
     "45 minutes",
 ];
 const PRESET_TEXTS: [&str; 4] = ["5m", "15m", "25m", "45m"];
-const DEFAULT_PRESET: usize = 1; // 15 minutes.
+const DEFAULT_SECS: i64 = 15 * 60;
+/// Longest settable timer: 23:59:59.
+const MAX_SECS: i64 = 24 * 3600 - 1;
+/// Points of vertical drag per step of a timer digit.
+const DRAG_STEP_PT: f32 = 22.0;
 
 // Palette: near-black desk display, warm amber for the timer and Dim, green for Music.
 const MUTED: u32 = 0xffffff99;
@@ -76,9 +80,58 @@ fn format_date(dt: &chrono::DateTime<Local>) -> String {
     )
 }
 
+/// Countdown text that drops leading zero units: `1:05:09`, `5:09`, `9`.
 fn format_remaining(total_secs: i64) -> String {
-    let total_secs = total_secs.max(0);
-    format!("{:02}:{:02}", total_secs / 60, total_secs % 60)
+    let t = total_secs.max(0);
+    let (h, m, s) = (t / 3600, (t / 60) % 60, t % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else if m > 0 {
+        format!("{m}:{s:02}")
+    } else {
+        format!("{s}")
+    }
+}
+
+/// `(hours, minutes, seconds)` of a duration.
+fn split_hms(total_secs: i64) -> (i64, i64, i64) {
+    let t = total_secs.clamp(0, MAX_SECS);
+    (t / 3600, (t / 60) % 60, t % 60)
+}
+
+/// Which part of the timer a drag changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimeUnit {
+    Hours,
+    Minutes,
+    Seconds,
+}
+
+impl TimeUnit {
+    fn max(self) -> i64 {
+        match self {
+            TimeUnit::Hours => 23,
+            TimeUnit::Minutes | TimeUnit::Seconds => 59,
+        }
+    }
+}
+
+/// `total_secs` with one unit moved by `steps` (clamped within that unit, the others kept).
+fn adjust_unit(total_secs: i64, unit: TimeUnit, steps: i64) -> i64 {
+    let (h, m, s) = split_hms(total_secs);
+    let clamp = |v: i64| v.clamp(0, unit.max());
+    let (h, m, s) = match unit {
+        TimeUnit::Hours => (clamp(h + steps), m, s),
+        TimeUnit::Minutes => (h, clamp(m + steps), s),
+        TimeUnit::Seconds => (h, m, clamp(s + steps)),
+    };
+    h * 3600 + m * 60 + s
+}
+
+/// Track position `mm:ss`.
+fn format_mm_ss(total_secs: i64) -> String {
+    let t = total_secs.max(0);
+    format!("{:02}:{:02}", t / 60, t % 60)
 }
 
 /// Progress through a track, 0.0..=1.0.
@@ -91,7 +144,7 @@ fn progress_fraction(progress_ms: u64, duration_ms: u64) -> f32 {
 
 /// `mm:ss` for a track position given in milliseconds.
 fn format_track_time(ms: u64) -> String {
-    format_remaining((ms / 1000) as i64)
+    format_mm_ss((ms / 1000) as i64)
 }
 
 /// Which Music screen to show. Used so the card is only rebuilt when the screen changes,
@@ -115,8 +168,10 @@ pub fn Dashboard() -> impl IntoElement {
     let now_local = signal(Local::now());
     set_interval(Duration::from_millis(500), move || now_local.set(Local::now()));
 
+    crate::debug_log::install();
     let twelve_hour = signal(locale_settings().hour_cycle.twelve_hour());
     let night_dim = signal(false);
+    let debug_open = signal(false);
 
     let clock_display = computed(move || {
         let dt = now_local.get();
@@ -132,8 +187,9 @@ pub fn Dashboard() -> impl IntoElement {
     spotify::start(spotify_state);
 
     // Focus timer state. Hidden until `timer_open`; see `timer_header_button`.
-    let preset_index = signal(DEFAULT_PRESET);
-    let remaining_secs = signal(PRESETS_MIN[DEFAULT_PRESET] * 60);
+    // `duration_secs` is the set time (what Reset and finishing go back to).
+    let duration_secs = signal(DEFAULT_SECS);
+    let remaining_secs = signal(DEFAULT_SECS);
     let running = signal(false);
     let timer_open = signal(false);
     let timer_finished = signal(false);
@@ -153,7 +209,7 @@ pub fn Dashboard() -> impl IntoElement {
                 let left = ((deadline_ms - now) / 1000.0).ceil() as i64;
                 if left <= 0 {
                     // Finished: put the timer away and flag it in the header until tapped.
-                    remaining_secs.set(PRESETS_MIN[preset_index.get_untracked()] * 60);
+                    remaining_secs.set(duration_secs.get_untracked());
                     running.set(false);
                     timer_open.set(false);
                     timer_finished.set(true);
@@ -183,7 +239,8 @@ pub fn Dashboard() -> impl IntoElement {
                         date_display,
                         twelve_hour,
                         night_dim,
-                        preset_index,
+                        debug_open,
+                        duration_secs,
                         remaining_secs,
                         running,
                         timer_open,
@@ -195,16 +252,17 @@ pub fn Dashboard() -> impl IntoElement {
                             .style_when(is_landscape, |s| s.flex_1().flex_row())
                             .child(music_card(spotify_state))
                             .child(when(timer_open, move || {
-                                focus_timer_panel(preset_index, remaining_secs, running, timer_open)
+                                focus_timer_panel(duration_secs, remaining_secs, running, timer_open)
                             })),
                     ),
             ),
         )
         .child(night_dim_overlay(night_dim))
+        .child(when(debug_open, move || debug_overlay(debug_open, spotify_state)))
 }
 
 // ---------------------------------------------------------------------------------------------
-// Top band: clock on the left, controls and camera on the right.
+// Top band: clock on the left, controls on the right.
 // ---------------------------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
@@ -213,7 +271,8 @@ fn top_band(
     date_display: Memo<String>,
     twelve_hour: Signal<bool>,
     night_dim: Signal<bool>,
-    preset_index: Signal<usize>,
+    debug_open: Signal<bool>,
+    duration_secs: Signal<i64>,
     remaining_secs: Signal<i64>,
     running: Signal<bool>,
     timer_open: Signal<bool>,
@@ -222,7 +281,7 @@ fn top_band(
     view()
         .gap(px(16.0))
         .style_when(is_landscape, |s| s.flex_row().justify_between().items_start())
-        .child(clock_block(clock_display, date_display))
+        .child(clock_block(clock_display, date_display, debug_open))
         .child(
             view()
                 .gap(px(12.0))
@@ -234,7 +293,7 @@ fn top_band(
                         .gap(px(10.0))
                         .style_when(is_landscape, |s| s.justify_end())
                         .child(timer_header_button(
-                            preset_index,
+                            duration_secs,
                             remaining_secs,
                             running,
                             timer_open,
@@ -242,16 +301,20 @@ fn top_band(
                         ))
                         .child(hour_cycle_toggle(twelve_hour))
                         .child(night_dim_toggle(night_dim)),
-                )
-                .child(camera_tile()),
+                ),
         )
 }
 
 fn clock_block(
     clock_display: Memo<(String, &'static str)>,
     date_display: Memo<String>,
+    debug_open: Signal<bool>,
 ) -> impl IntoElement {
     view()
+        .test_id("clock_block")
+        .hint("Hold to show the debug log")
+        .on_long_press(move || debug_open.set(true))
+        .long_press_delay(700.0)
         .gap(px(2.0))
         .child(
             text("")
@@ -335,45 +398,15 @@ fn night_dim_toggle(night_dim: Signal<bool>) -> impl IntoElement {
         .child(header_chip_text("Dim"))
 }
 
-/// Compact camera tile. Imou is not set up, so it only says so.
-fn camera_tile() -> impl IntoElement {
-    view()
-        .accessible(true)
-        .label("Camera, not configured")
-        .test_id("camera_status")
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap(px(12.0))
-        .px(px(18.0))
-        .min_h(px(56.0))
-        .rounded(px(16.0))
-        .border_1()
-        .border_color(rgba(HAIRLINE))
-        .bg(rgba(CARD))
-        .child(
-            text("Camera")
-                .text_size(px(16.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgba(MUTED)),
-        )
-        .child(
-            text("Not configured")
-                .text_size(px(16.0))
-                .font_weight(FontWeight::BOLD)
-                .text_color(rgba(AMBER)),
-        )
-}
-
 // ---------------------------------------------------------------------------------------------
 // Focus timer: header button + panel, only shown when needed.
 // ---------------------------------------------------------------------------------------------
 
-/// The one header control for the timer:
-/// idle → "Timer" (opens the panel); running or paused → the remaining time (toggles the panel);
+/// The one header control for the timer, which also closes the panel (there is no Close button):
+/// idle → "Timer" (toggles the panel); running or paused → the remaining time (toggles the panel);
 /// just finished → "Time's up" until tapped.
 fn timer_header_button(
-    preset_index: Signal<usize>,
+    duration_secs: Signal<i64>,
     remaining_secs: Signal<i64>,
     running: Signal<bool>,
     timer_open: Signal<bool>,
@@ -383,7 +416,7 @@ fn timer_header_button(
     let mode = computed(move || {
         if timer_finished.get() {
             2u8
-        } else if running.get() || remaining_secs.get() < PRESETS_MIN[preset_index.get()] * 60 {
+        } else if running.get() || remaining_secs.get() < duration_secs.get() {
             1
         } else {
             0
@@ -447,8 +480,8 @@ fn timer_header_button(
             .role(AccessibilityRole::Button)
             .test_id("timer_open")
             .label("Focus timer")
-            .hint("Opens the timer")
-            .on_press(move || timer_open.set(true))
+            .hint("Shows or hides the timer")
+            .on_press(move || timer_open.update(|v| *v = !*v))
             .min_w(px(56.0))
             .min_h(px(48.0))
             .px(px(18.0))
@@ -457,7 +490,7 @@ fn timer_header_button(
             .rounded_full()
             .border_1()
             .border_color(rgba(0xffffff22))
-            .bg(rgba(0xffffff0f))
+            .bg(move || if timer_open.get() { rgba(0xffffff2e) } else { rgba(0xffffff0f) })
             .active(|s| s.bg(rgba(0xffffff26)))
             .child(header_chip_text("Timer"))
             .into_element(),
@@ -465,7 +498,7 @@ fn timer_header_button(
 }
 
 fn focus_timer_panel(
-    preset_index: Signal<usize>,
+    duration_secs: Signal<i64>,
     remaining_secs: Signal<i64>,
     running: Signal<bool>,
     timer_open: Signal<bool>,
@@ -478,70 +511,136 @@ fn focus_timer_panel(
         .border_1()
         .border_color(rgba(HAIRLINE))
         .bg(rgba(CARD))
-        .style_when(is_landscape, |s| s.w(px(300.0)))
+        .style_when(is_landscape, |s| s.w(px(320.0)))
         .child(
-            view()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .child(
-                    text("Focus timer")
-                        .role(AccessibilityRole::Header)
-                        .text_size(px(18.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgba(MUTED)),
-                )
-                .child(
-                    view()
-                        .role(AccessibilityRole::Button)
-                        .test_id("timer_close")
-                        .label("Close timer")
-                        .hint("Hides the timer; a running countdown keeps going")
-                        .on_press(move || timer_open.set(false))
-                        .min_w(px(48.0))
-                        .min_h(px(48.0))
-                        .px(px(14.0))
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .bg(rgba(0xffffff12))
-                        .active(|s| s.bg(rgba(0xffffff26)))
-                        .child(
-                            text("Close")
-                                .text_size(px(15.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(white()),
-                        ),
-                ),
+            text("Focus timer")
+                .role(AccessibilityRole::Header)
+                .text_size(px(18.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgba(MUTED)),
         )
+        // Running: the countdown, leading zero units hidden. Stopped: drag the digits to set it.
         .child(
-            text(move || format_remaining(remaining_secs.get()))
-                .test_id("timer_remaining")
-                .role(AccessibilityRole::Timer)
-                .text_size(px(72.0))
-                .font_weight(FontWeight::BOLD)
-                .tabular_nums()
-                .text_color(white()),
+            when(running, move || {
+                text(move || format_remaining(remaining_secs.get()))
+                    .test_id("timer_remaining")
+                    .role(AccessibilityRole::Timer)
+                    .text_size(px(72.0))
+                    .font_weight(FontWeight::BOLD)
+                    .tabular_nums()
+                    .text_color(white())
+            })
+            .otherwise(move || timer_editor(duration_secs, remaining_secs)),
         )
         .child(
             view()
                 .flex_row()
                 .flex_wrap()
                 .gap(px(8.0))
-                .child((0..PRESETS_MIN.len()).map(|i| preset_button(i, preset_index, remaining_secs, running))),
+                .child((0..PRESETS_MIN.len()).map(|i| preset_button(i, duration_secs, remaining_secs, running))),
         )
         .child(
             view()
                 .flex_row()
                 .gap(px(10.0))
                 .child(run_pause_button(remaining_secs, running))
-                .child(reset_button(preset_index, remaining_secs, running, timer_open)),
+                .child(reset_button(duration_secs, remaining_secs, running, timer_open)),
         )
+}
+
+/// Hours, minutes and seconds side by side; drag one up or down to change it. Zero units are
+/// dimmed here, and the running countdown hides them (`format_remaining`).
+fn timer_editor(duration_secs: Signal<i64>, remaining_secs: Signal<i64>) -> impl IntoElement {
+    view()
+        .test_id("timer_editor")
+        .gap(px(4.0))
+        .child(
+            view()
+                .flex_row()
+                .items_end()
+                .justify_center()
+                .gap(px(6.0))
+                .child(time_wheel(TimeUnit::Hours, duration_secs, remaining_secs))
+                .child(time_colon())
+                .child(time_wheel(TimeUnit::Minutes, duration_secs, remaining_secs))
+                .child(time_colon())
+                .child(time_wheel(TimeUnit::Seconds, duration_secs, remaining_secs)),
+        )
+        .child(
+            text("Drag a number up or down to change it")
+                .test_id("timer_drag_hint")
+                .text_size(px(14.0))
+                .text_center()
+                .text_color(rgba(FAINT)),
+        )
+}
+
+fn time_colon() -> impl IntoElement {
+    text(":")
+        .text_size(px(52.0))
+        .font_weight(FontWeight::BOLD)
+        .text_color(rgba(FAINT))
+        .pb(px(20.0))
+}
+
+fn time_wheel(unit: TimeUnit, duration_secs: Signal<i64>, remaining_secs: Signal<i64>) -> impl IntoElement {
+    let (test_id, suffix, name) = match unit {
+        TimeUnit::Hours => ("timer_hours", "h", "Hours"),
+        TimeUnit::Minutes => ("timer_minutes", "m", "Minutes"),
+        TimeUnit::Seconds => ("timer_seconds", "s", "Seconds"),
+    };
+    let value = computed(move || {
+        let (h, m, s) = split_hms(remaining_secs.get());
+        match unit {
+            TimeUnit::Hours => h,
+            TimeUnit::Minutes => m,
+            TimeUnit::Seconds => s,
+        }
+    });
+    let start_total = stored(0_i64);
+    let dragging = signal(false);
+    let set_total = move |total: i64| {
+        duration_secs.set(total);
+        remaining_secs.set(total);
+    };
+    view()
+        .test_id(test_id)
+        .label(move || format!("{name}: {}", value.get()))
+        .min_w(px(78.0))
+        .py(px(6.0))
+        .items_center()
+        .rounded(px(14.0))
+        .bg(move || if dragging.get() { rgba(0xffffff1f) } else { rgba(0xffffff08) })
+        // Vertical drags only, so a sideways swipe still scrolls the page.
+        .claim_touches(TouchClaim::on_pan(PanActivation::vertical(px(4.0), px(24.0))))
+        .keep_touches(true)
+        .on_responder_grant(move |_: &ResponderEvent| {
+            start_total.replace(remaining_secs.get_untracked());
+            dragging.set(true);
+        })
+        .on_responder_move(move |e: &ResponderEvent| {
+            // Up = more.
+            let steps = (-e.gesture.delta.y.0 / DRAG_STEP_PT).trunc() as i64;
+            let total = adjust_unit(start_total.get(), unit, steps);
+            if total != remaining_secs.get_untracked() {
+                set_total(total);
+            }
+        })
+        .on_responder_release(move |_: &ResponderEvent| dragging.set(false))
+        .on_responder_terminate(move |_: &ResponderEvent| dragging.set(false))
+        .child(
+            text(move || format!("{:02}", value.get()))
+                .text_size(px(60.0))
+                .font_weight(FontWeight::BOLD)
+                .tabular_nums()
+                .text_color(move || if value.get() == 0 { rgba(FAINT) } else { rgba(0xffffffff) }),
+        )
+        .child(text(suffix).text_size(px(14.0)).text_color(rgba(MUTED)))
 }
 
 fn preset_button(
     i: usize,
-    preset_index: Signal<usize>,
+    duration_secs: Signal<i64>,
     remaining_secs: Signal<i64>,
     running: Signal<bool>,
 ) -> impl IntoElement {
@@ -561,9 +660,9 @@ fn preset_button(
         .rounded_full()
         .border_1()
         .border_color(rgba(0xffffff22))
-        .bg(move || if preset_index.get() == i { rgba(0xffffff33) } else { rgba(0xffffff0a) })
+        .bg(move || if duration_secs.get() == minutes * 60 { rgba(0xffffff33) } else { rgba(0xffffff0a) })
         .on_press(move || {
-            preset_index.set(i);
+            duration_secs.set(minutes * 60);
             remaining_secs.set(minutes * 60);
             running.set(false);
         })
@@ -613,9 +712,9 @@ fn run_pause_button(remaining_secs: Signal<i64>, running: Signal<bool>) -> impl 
         )
 }
 
-/// Reset stops the countdown, restores the preset time and puts the timer away.
+/// Reset stops the countdown, restores the set time and puts the timer away.
 fn reset_button(
-    preset_index: Signal<usize>,
+    duration_secs: Signal<i64>,
     remaining_secs: Signal<i64>,
     running: Signal<bool>,
     timer_open: Signal<bool>,
@@ -636,7 +735,7 @@ fn reset_button(
         .active(|s| s.bg(rgba(0xffffff1a)))
         .on_press(move || {
             running.set(false);
-            remaining_secs.set(PRESETS_MIN[preset_index.get()] * 60);
+            remaining_secs.set(duration_secs.get());
             timer_open.set(false);
         })
         .child(
@@ -1065,6 +1164,123 @@ fn transport_button(
         )
 }
 
+// ---------------------------------------------------------------------------------------------
+// Debug log overlay: hold the clock to open it.
+// ---------------------------------------------------------------------------------------------
+
+fn debug_button(test_id: &'static str, label: &'static str, on_press: impl Fn() + 'static) -> impl IntoElement {
+    view()
+        .role(AccessibilityRole::Button)
+        .test_id(test_id)
+        .label(label)
+        .on_press(on_press)
+        .min_h(px(44.0))
+        .px(px(18.0))
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_1()
+        .border_color(rgba(0xffffff33))
+        .bg(rgba(0xffffff12))
+        .active(|s| s.bg(rgba(0xffffff2a)))
+        .child(text(label).text_size(px(16.0)).font_weight(FontWeight::SEMIBOLD).text_color(white()))
+}
+
+/// Newest lines first, so the latest step is always at the top without scrolling.
+fn newest_first(log: &str) -> String {
+    let mut lines: Vec<&str> = log.lines().collect();
+    lines.reverse();
+    lines.join("\n")
+}
+
+fn debug_overlay(debug_open: Signal<bool>, spotify_state: Signal<SpotifyState>) -> impl IntoElement {
+    let log_text = signal(newest_first(&crate::debug_log::text()));
+    let seen = stored(crate::debug_log::version());
+    let copied = signal(false);
+    set_interval(Duration::from_millis(500), move || {
+        let v = crate::debug_log::version();
+        if v != seen.get() {
+            seen.replace(v);
+            log_text.set(newest_first(&crate::debug_log::text()));
+        }
+    });
+    let state_line = move || {
+        let state = match spotify_state.get() {
+            SpotifyState::Connected(p) => format!(
+                "Connected (device {:?}, playing {}, can control {}, track {:?})",
+                p.device, p.is_playing, p.can_control, p.title
+            ),
+            other => format!("{other:?}"),
+        };
+        format!("Spotify state: {state}")
+    };
+    view()
+        .test_id("debug_overlay")
+        .absolute()
+        .inset_0()
+        .bg(rgba(0x000000f2))
+        .p(px(24.0))
+        .gap(px(12.0))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .child(
+                    text("Debug log")
+                        .role(AccessibilityRole::Header)
+                        .flex_1()
+                        .text_size(px(28.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(white()),
+                )
+                .child(debug_button("debug_copy", "Copy", move || {
+                    let mut all = state_line();
+                    all.push('\n');
+                    all.push_str(&crate::debug_log::text());
+                    set_clipboard(all);
+                    copied.set(true);
+                }))
+                .child(debug_button("debug_clear", "Clear", move || {
+                    crate::debug_log::clear();
+                    crate::debug_log::info("log cleared");
+                }))
+                .child(debug_button("debug_close", "Close", move || debug_open.set(false))),
+        )
+        .child(
+            text(state_line)
+                .test_id("debug_state")
+                .text_size(px(15.0))
+                .text_color(rgba(GREEN)),
+        )
+        .child(
+            text(move || {
+                format!(
+                    "{} lines, newest first{}{}",
+                    crate::debug_log::line_count(),
+                    if crate::debug_log::capturing_crates() { "" } else { " (librespot lines not captured)" },
+                    if copied.get() { " - copied to clipboard" } else { "" }
+                )
+            })
+            .text_size(px(13.0))
+            .text_color(rgba(MUTED)),
+        )
+        .child(
+            scroll()
+                .flex_1()
+                .rounded(px(12.0))
+                .bg(rgba(0xffffff0a))
+                .child(
+                    text(move || log_text.get())
+                        .test_id("debug_log_text")
+                        .p(px(12.0))
+                        .text_size(px(13.0))
+                        .line_height(px(18.0))
+                        .text_color(rgba(0xffffffdd)),
+                ),
+        )
+}
+
 /// A click-through dark overlay for night use; fades in/out rather than snapping.
 fn night_dim_overlay(night_dim: Signal<bool>) -> impl IntoElement {
     view()
@@ -1177,10 +1393,24 @@ mod tests {
     }
 
     #[test]
-    fn remaining_time_formats_as_mm_ss() {
-        assert_eq!(format_remaining(65), "01:05");
-        assert_eq!(format_remaining(0), "00:00");
-        assert_eq!(format_remaining(-5), "00:00");
+    fn remaining_time_hides_zero_hours_and_minutes() {
+        assert_eq!(format_remaining(3 * 3600 + 5 * 60 + 9), "3:05:09");
+        assert_eq!(format_remaining(3600), "1:00:00");
+        assert_eq!(format_remaining(65), "1:05");
+        assert_eq!(format_remaining(15 * 60), "15:00");
+        assert_eq!(format_remaining(59), "59");
+        assert_eq!(format_remaining(0), "0");
+        assert_eq!(format_remaining(-5), "0");
+    }
+
+    #[test]
+    fn adjusting_a_unit_keeps_the_others_and_clamps() {
+        let t = 1 * 3600 + 30 * 60 + 15;
+        assert_eq!(adjust_unit(t, TimeUnit::Hours, 2), 3 * 3600 + 30 * 60 + 15);
+        assert_eq!(adjust_unit(t, TimeUnit::Minutes, 40), 1 * 3600 + 59 * 60 + 15);
+        assert_eq!(adjust_unit(t, TimeUnit::Seconds, -20), 1 * 3600 + 30 * 60);
+        assert_eq!(adjust_unit(t, TimeUnit::Hours, -5), 30 * 60 + 15);
+        assert_eq!(adjust_unit(0, TimeUnit::Hours, 99), 23 * 3600);
     }
 
     #[test]
@@ -1192,12 +1422,11 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_shows_clock_music_sign_in_and_camera() {
+    fn dashboard_shows_clock_and_music_sign_in_without_camera() {
         let mut app = start_landscape();
         app.wait_for("id:clock_time").unwrap();
-        app.wait_for("id:camera_status").unwrap();
-        app.wait_for("Not configured").unwrap();
         app.wait_for("id:music_status").unwrap();
+        assert_eq!(app.screen().count("id:camera_status").unwrap(), 0);
         // No saved Spotify login in a fresh app: offer sign-in, no playback controls.
         app.wait_for("id:spotify_sign_in").unwrap();
         assert_eq!(app.screen().count("id:spotify_play_pause").unwrap(), 0);
@@ -1213,16 +1442,22 @@ mod tests {
         assert_eq!(app.screen().count("id:timer_remaining").unwrap(), 0);
         assert_eq!(app.screen().count("id:timer_indicator").unwrap(), 0);
 
+        // The same Timer button opens and closes the panel; there is no Close button.
         app.press("id:timer_open").unwrap();
-        app.wait_for("id:timer_remaining").unwrap();
-        app.wait_for("15:00").unwrap();
+        app.wait_for("id:timer_editor").unwrap();
+        assert_eq!(app.screen().count("id:timer_close").unwrap(), 0);
+        app.press("id:timer_open").unwrap();
+        app.wait_for_gone("id:timer_panel", Duration::from_secs(5)).unwrap();
+        app.press("id:timer_open").unwrap();
+        app.wait_for("id:timer_panel").unwrap();
 
         app.press("id:timer_toggle").unwrap();
         app.wait_for("id:timer_indicator").unwrap();
+        app.wait_for("id:timer_remaining").unwrap();
         assert_eq!(app.screen().count("id:timer_open").unwrap(), 0);
 
-        // Closing the panel keeps the running indicator.
-        app.press("id:timer_close").unwrap();
+        // The indicator closes the panel and keeps counting.
+        app.press("id:timer_indicator").unwrap();
         app.wait_for_gone("id:timer_panel", Duration::from_secs(5)).unwrap();
         app.wait_for("id:timer_indicator").unwrap();
 
@@ -1238,23 +1473,50 @@ mod tests {
         app.press("id:timer_open").unwrap();
         app.wait_for("id:timer_preset_5").unwrap();
         app.press("id:timer_preset_5").unwrap();
-        app.wait_for("05:00").unwrap();
         app.press("id:timer_toggle").unwrap();
+        app.wait_for("5:00").unwrap();
         app.wait_for("id:timer_indicator").unwrap();
         app.press("id:timer_reset").unwrap();
         app.wait_for_gone("id:timer_panel", Duration::from_secs(5)).unwrap();
         app.wait_for("id:timer_open").unwrap();
         assert_eq!(app.screen().count("id:timer_indicator").unwrap(), 0);
-        // Opening again shows the preset time, not a stale countdown.
+        // Opening again shows the set time, not a stale countdown.
         app.press("id:timer_open").unwrap();
-        app.wait_for("05:00").unwrap();
+        app.wait_for("id:timer_editor").unwrap();
+        app.wait_for("05").unwrap();
+    }
+
+    #[test]
+    fn dragging_a_digit_changes_the_time() {
+        let mut app = start_landscape();
+        app.wait_for("id:timer_open").unwrap();
+        app.press("id:timer_open").unwrap();
+        app.wait_for("id:timer_hours").unwrap();
+        // Up by 2 steps (plus the pan slop) adds 2 hours to the default 15 minutes.
+        app.drag("id:timer_hours", nsh_core::geometry::point(px(0.0), px(-(2.0 * DRAG_STEP_PT + 15.0)))).unwrap();
+        app.wait_for("02").unwrap();
+        app.press("id:timer_toggle").unwrap();
+        app.wait_for("id:timer_remaining").unwrap();
+    }
+
+    #[test]
+    fn holding_the_clock_opens_the_debug_log() {
+        let mut app = start_landscape();
+        app.wait_for("id:clock_block").unwrap();
+        assert_eq!(app.screen().count("id:debug_overlay").unwrap(), 0);
+        crate::debug_log::info("test line for overlay");
+        app.long_press("id:clock_block").unwrap();
+        app.wait_for("id:debug_overlay").unwrap();
+        app.wait_for("Spotify state: SignedOut").unwrap();
+        app.press("id:debug_close").unwrap();
+        app.wait_for_gone("id:debug_overlay", Duration::from_secs(5)).unwrap();
     }
 
     #[test]
     fn landscape_layout_fills_the_screen() {
         let mut app = start_landscape();
         app.wait_for("id:music_status").unwrap();
-        app.wait_for("id:camera_status").unwrap();
+        app.wait_for("id:night_dim_toggle").unwrap();
         let nodes = app.screen().layout_nodes();
         let find = |id: &str| {
             nodes
@@ -1264,7 +1526,7 @@ mod tests {
                 .bounds
         };
         let music = find("music_status");
-        let camera = find("camera_status");
+        let controls = find("night_dim_toggle");
         let clock = find("clock_time");
         // Music is the big content: most of the width, most of the height left under the clock.
         assert!(music.size.width.0 > 900.0, "music width {:?}", music.size);
@@ -1273,10 +1535,9 @@ mod tests {
             music.origin.y.0 + music.size.height.0 <= 768.0 + 0.5,
             "music passes the bottom: {music:?}"
         );
-        // The camera tile is compact and sits in the top band, beside the clock.
-        assert!(camera.size.height.0 < 90.0, "camera height {:?}", camera.size);
-        assert!(camera.origin.y.0 < music.origin.y.0);
-        assert!(camera.origin.x.0 > clock.origin.x.0 + 300.0);
+        // The header controls sit in the top band, beside the clock.
+        assert!(controls.origin.y.0 < music.origin.y.0);
+        assert!(controls.origin.x.0 > clock.origin.x.0 + 300.0);
     }
 
     #[test]
@@ -1350,7 +1611,6 @@ mod tests {
         let mut app = Headless::start(EngineConfig::new(Root::of::<Dashboard>())).unwrap();
         app.wait_for("id:clock_time").unwrap();
         app.wait_for("id:music_status").unwrap();
-        app.wait_for("id:camera_status").unwrap();
         app.wait_for("id:timer_open").unwrap();
     }
 }

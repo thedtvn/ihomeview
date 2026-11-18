@@ -3,8 +3,10 @@
 A native desk dashboard for an old iPad, written in Rust with [Native Shell](https://nsh.dev/) (UIKit views, no WebView or JavaScript runtime).
 
 - Large clock and date, 12/24-hour switch and night dimming.
-- A focus timer that stays hidden until you open it.
+- A focus timer that stays hidden until you open it; drag the hours, minutes or seconds up/down to set it.
 - A music card for Spotify (experimental, see below).
+- Full screen: the iOS status bar is hidden.
+- Hold the clock to open a debug log (Spotify connection steps and errors, with Copy).
 
 ## Requirements
 
@@ -27,7 +29,7 @@ Status and evidence: [docs/spotify-feasibility.md](docs/spotify-feasibility.md) 
 
 ## Not included
 
-Camera streams, weather, calendar and PC notifications are not implemented. The iPad does not become an Apple Home hub or a Windows display.
+Cameras, weather, calendar and PC notifications are not included. The iPad does not become an Apple Home hub or a Windows display.
 
 ## Build
 

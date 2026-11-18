@@ -6,11 +6,14 @@
   "rust": ".",
   "root": "App",
   "appearance": "dark",
+  "statusBar": { "hidden": true },
   "ios": {
     "infoPlist": {
       "MinimumOSVersion": "15.0",
       "UIRequiredDeviceCapabilities": ["arm64"],
       "UIDeviceFamily": [2],
+      "UIStatusBarHidden": true,
+      "UIViewControllerBasedStatusBarAppearance": false,
       "LSApplicationQueriesSchemes": ["spotify"]
     }
   }

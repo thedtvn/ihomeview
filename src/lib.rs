@@ -2,6 +2,7 @@
 use nsh_core::prelude::*;
 
 pub mod dashboard;
+pub mod debug_log;
 pub mod spotify;
 
 /// Dashboard components available to Native Shell's native runner.

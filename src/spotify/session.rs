@@ -16,6 +16,8 @@ use protobuf::Message as _;
 use reqwest::Method;
 use tokio::sync::mpsc;
 
+use crate::debug_log as dlog;
+
 use super::{
     Playback, auth,
     connect::{self, RemoteCommand, TrackInfo},
@@ -39,6 +41,9 @@ pub enum Request {
     Command(RemoteCommand),
     Stop,
 }
+
+/// How long each connection step may take before the session gives up with an error.
+const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Holds the latest cluster plus resolved track metadata.
 struct Observed {
@@ -119,11 +124,26 @@ pub async fn run(
     events: mpsc::UnboundedSender<Event>,
     mut requests: mpsc::UnboundedReceiver<Request>,
 ) {
-    let ended = |message: Option<String>, signed_out: bool| Event::Ended { message, signed_out };
+    let ended = |message: Option<String>, signed_out: bool| {
+        if let Some(m) = &message {
+            dlog::error(format!("session ended: {m}"));
+        } else {
+            dlog::info("session ended");
+        }
+        Event::Ended { message, signed_out }
+    };
 
     // 1. Fresh access token (refresh tokens can rotate).
+    dlog::info(format!("step 1/4: refreshing access token (device {device_id})"));
     let tokens = match auth::refresh(&refresh_token).await {
-        Ok(t) => t,
+        Ok(t) => {
+            dlog::info(format!(
+                "step 1/4 ok: access token received, expires in {}s, rotated refresh: {}",
+                t.expires_in,
+                t.refresh_token.as_deref().is_some_and(|r| !r.is_empty() && r != refresh_token)
+            ));
+            t
+        }
         Err(auth::AuthError::Exchange(e)) if e.starts_with("HTTP 400") || e.starts_with("HTTP 401") => {
             let _ = events.send(ended(Some("Spotify sign-in expired. Please sign in again.".into()), true));
             return;
@@ -142,6 +162,7 @@ pub async fn run(
     config.client_id = auth::CLIENT_ID.into();
     config.device_id = device_id.clone();
     let session = Session::new(config, None);
+    dlog::info(format!("session created, client id {}", session.client_id()));
 
     // Listeners must be registered before the dealer starts.
     let dealer = session.dealer();
@@ -161,18 +182,51 @@ pub async fn run(
         }
     };
 
-    if let Err(e) = session
-        .connect(Credentials::with_access_token(tokens.access_token), false)
-        .await
+    dlog::info("step 2/4: connecting to Spotify access point (apresolve + login)");
+    match tokio::time::timeout(
+        STEP_TIMEOUT,
+        session.connect(Credentials::with_access_token(tokens.access_token), false),
+    )
+    .await
     {
-        let _ = events.send(ended(Some(format!("Spotify login failed ({}).", short(e))), false));
-        return;
+        Ok(Ok(())) => dlog::info(format!(
+            "step 2/4 ok: logged in as {} (country {})",
+            session.username(),
+            session.country()
+        )),
+        Ok(Err(e)) => {
+            dlog::error(format!("session.connect error: {e:?}"));
+            let _ = events.send(ended(Some(format!("Spotify login failed ({}).", short(e))), false));
+            return;
+        }
+        Err(_) => {
+            let _ = events.send(ended(
+                Some(format!("Spotify login timed out after {}s.", STEP_TIMEOUT.as_secs())),
+                false,
+            ));
+            session.shutdown();
+            return;
+        }
     }
-    if let Err(e) = session.dealer().start().await {
-        let _ = events.send(ended(Some(format!("Spotify connection failed ({}).", short(e))), false));
-        session.shutdown();
-        return;
+    dlog::info("step 3/4: starting dealer websocket");
+    match tokio::time::timeout(STEP_TIMEOUT, session.dealer().start()).await {
+        Ok(Ok(())) => dlog::info("step 3/4 ok: dealer connected"),
+        Ok(Err(e)) => {
+            dlog::error(format!("dealer start error: {e:?}"));
+            let _ = events.send(ended(Some(format!("Spotify connection failed ({}).", short(e))), false));
+            session.shutdown();
+            return;
+        }
+        Err(_) => {
+            let _ = events.send(ended(
+                Some(format!("Spotify dealer timed out after {}s.", STEP_TIMEOUT.as_secs())),
+                false,
+            ));
+            session.shutdown();
+            return;
+        }
     }
+    dlog::info("step 4/4: waiting for connection id to register hidden observer");
 
     let mut observed = Observed { cluster: None, extra: None };
     let mut registered = false;
@@ -183,20 +237,38 @@ pub async fn run(
     loop {
         tokio::select! {
             id = connection_ids.next() => {
-                let Some(Ok(id)) = id else {
-                    let _ = events.send(ended(Some("Spotify connection lost.".into()), false));
-                    break;
+                let id = match id {
+                    Some(Ok(id)) => id,
+                    Some(Err(e)) => {
+                        dlog::error(format!("connection id error: {e:?}"));
+                        let _ = events.send(ended(Some("Spotify connection lost.".into()), false));
+                        break;
+                    }
+                    None => {
+                        let _ = events.send(ended(Some("Spotify connection lost.".into()), false));
+                        break;
+                    }
                 };
+                dlog::info("got connection id; registering observer device");
                 session.set_connection_id(&id);
                 let request = connect::observer_request(&device_id, &session.client_id(), &session.session_id());
                 match session.spclient().put_connect_state_request(&request).await {
                     Ok(bytes) => {
                         registered = true;
-                        if let Ok(cluster) = Cluster::parse_from_bytes(&bytes) {
-                            observed.cluster = Some(cluster);
+                        match Cluster::parse_from_bytes(&bytes) {
+                            Ok(cluster) => {
+                                dlog::info(format!(
+                                    "observer registered; {} devices, active '{}'",
+                                    cluster.device.len(),
+                                    cluster.active_device_id
+                                ));
+                                observed.cluster = Some(cluster);
+                            }
+                            Err(e) => dlog::warn(format!("observer registered; cluster parse failed: {e}")),
                         }
                     }
                     Err(e) => {
+                        dlog::error(format!("put_connect_state_request error: {e:?}"));
                         let _ = events.send(Event::Error(format!("Could not watch Spotify devices ({}).", short(e))));
                     }
                 }
@@ -206,21 +278,31 @@ pub async fn run(
                     let _ = events.send(ended(Some("Spotify connection lost.".into()), false));
                     break;
                 };
-                if let Ok(mut update) = update {
-                    if let Some(cluster) = update.cluster.take() {
-                        observed.cluster = Some(cluster);
+                match update {
+                    Ok(mut update) => {
+                        if let Some(cluster) = update.cluster.take() {
+                            if observed.cluster.as_ref().map(|c| &c.active_device_id) != Some(&cluster.active_device_id) {
+                                dlog::info(format!("cluster: active device now '{}'", cluster.active_device_id));
+                            }
+                            observed.cluster = Some(cluster);
+                        }
                     }
+                    Err(e) => dlog::warn(format!("cluster update parse error: {e}")),
                 }
             }
             request = requests.recv() => {
                 match request {
                     None | Some(Request::Stop) => break,
                     Some(Request::Command(cmd)) => {
+                        dlog::info(format!("command {cmd:?}"));
                         let target = observed.cluster.as_ref().map(|c| c.active_device_id.clone()).unwrap_or_default();
                         if !registered || target.is_empty() || target == device_id {
                             let _ = events.send(Event::Error("No active Spotify device to control.".into()));
                         } else if let Err(e) = send_command(&session, &device_id, &target, cmd).await {
+                            dlog::error(format!("command failed: {e}"));
                             let _ = events.send(Event::Error(format!("Command failed ({e}).")));
+                        } else {
+                            dlog::info(format!("command {cmd:?} sent to {target}"));
                         }
                     }
                 }
