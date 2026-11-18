@@ -1,6 +1,6 @@
 # Spotify backend (experimental)
 
-Goal: show and control Spotify playing on **another** Spotify Connect device (e.g. a Windows PC with Premium) from the iPad, without moving playback to the iPad. Built on librespot 0.8.0 (`librespot-core`, `librespot-oauth`, `librespot-protocol`; no playback/audio crates) and Spotify's **undocumented** Connect protocol. It can break whenever Spotify changes its services, and using an unofficial client may violate Spotify's terms.
+Goal: show and control Spotify playing on **another** Spotify Connect device (e.g. a Windows PC with Premium) from the iPad, without moving playback to the iPad. Built on librespot from GitHub `dev` (commit `15e02e8`, pinned in `Cargo.toml`; `librespot-core`, `librespot-oauth`, `librespot-protocol`; no playback/audio crates) and Spotify's **undocumented** Connect protocol. It can break whenever Spotify changes its services, and using an unofficial client may violate Spotify's terms.
 
 ## Files
 
@@ -33,6 +33,7 @@ Verified offline (`cargo test`): PKCE (RFC 7636 test vector), authorize URL, cal
 
 If any of these fails, the music card shows an error message; it never shows made-up playback.
 
-## Build note
+## Build notes
 
-librespot-core 0.8.0's build script fails with `vergen` 9.1.0. `Cargo.lock` pins `vergen` to 9.0.6 (`cargo update -p vergen@9.1.0 --precise 9.0.6`).
+- librespot `dev` pins `vergen = 9.0.6` itself (the crates.io 0.8.0 release does not, and fails to build with vergen 9.1).
+- librespot uses `sysinfo` 0.36, whose Apple process code calls `libc::proc_pidinfo`. `libc` ≥ 0.2.190 declares that function for macOS only, so the iOS build fails. `Cargo.toml` pins `libc = "=0.2.189"` until sysinfo/librespot fix it. Pins live in `Cargo.toml` because `nsh package` resolves a fresh lockfile.

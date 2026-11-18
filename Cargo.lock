@@ -2008,6 +2008,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
+ "libc",
  "librespot-core",
  "librespot-oauth",
  "librespot-protocol",
@@ -2024,7 +2025,6 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "url",
- "vergen",
 ]
 
 [[package]]
@@ -2271,9 +2271,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.191"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libloading"
@@ -2294,8 +2294,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "librespot-core"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "168bbe1c416980ddd9a969ebd6b50fb6c924eb1a3ded194285fa8ec0e2b1c68b"
+source = "git+https://github.com/librespot-org/librespot?rev=15e02e86c72d96dd39d548e3749f00abe39ffdde#15e02e86c72d96dd39d548e3749f00abe39ffdde"
 dependencies = [
  "aes 0.8.4",
  "base64 0.22.1",
@@ -2345,28 +2344,28 @@ dependencies = [
  "tokio-util",
  "url",
  "uuid",
+ "vergen",
  "vergen-gitcl",
 ]
 
 [[package]]
 name = "librespot-oauth"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d686417d49c9d2c363392ffe28d6e469daca20a82dc414740930e078f5829661"
+source = "git+https://github.com/librespot-org/librespot?rev=15e02e86c72d96dd39d548e3749f00abe39ffdde#15e02e86c72d96dd39d548e3749f00abe39ffdde"
 dependencies = [
  "log",
  "oauth2",
  "open",
  "reqwest",
  "thiserror 2.0.21",
+ "tokio",
  "url",
 ]
 
 [[package]]
 name = "librespot-protocol"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e01f0b2d39f83fa162eb91d4a16313bcf99e77daf258abe8f7b7bcb1160b084"
+source = "git+https://github.com/librespot-org/librespot?rev=15e02e86c72d96dd39d548e3749f00abe39ffdde#15e02e86c72d96dd39d548e3749f00abe39ffdde"
 dependencies = [
  "protobuf",
  "protobuf-codegen",
@@ -2511,9 +2510,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.2.5"
+version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20521a903f02b0a573cd6840e9d0a5a0cc043d361fe924092cd70f8556cc9c4a"
+checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
 dependencies = [
  "libc",
  "wasi",

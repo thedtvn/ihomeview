@@ -11,9 +11,10 @@ nsh-core = "=0.6.0"
 nsh-base = "=0.6.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Experimental Spotify Connect remote (see src/spotify/README.md). No playback/audio crates.
-librespot-core = { version = "=0.8.0", default-features = false, features = ["native-tls"] }
-librespot-oauth = { version = "=0.8.0", default-features = false, features = ["native-tls"] }
-librespot-protocol = "=0.8.0"
+# librespot from GitHub `dev`, pinned to one commit for reproducible builds.
+librespot-core = { git = "https://github.com/librespot-org/librespot", rev = "15e02e86c72d96dd39d548e3749f00abe39ffdde", default-features = false, features = ["native-tls"] }
+librespot-oauth = { git = "https://github.com/librespot-org/librespot", rev = "15e02e86c72d96dd39d548e3749f00abe39ffdde", default-features = false, features = ["native-tls"] }
+librespot-protocol = { git = "https://github.com/librespot-org/librespot", rev = "15e02e86c72d96dd39d548e3749f00abe39ffdde" }
 protobuf = "3.7"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["net", "io-util", "time", "rt", "macros", "sync"] }
@@ -26,9 +27,9 @@ rand = "0.8"
 url = "2"
 hex = "0.4"
 log = "0.4"
-# librespot-core 0.8.0's build script fails with vergen 9.1 (vergen-lib version split).
 # Pinned here, not only in Cargo.lock, because `nsh package` resolves a fresh lockfile.
-vergen = { version = "=9.0.6", default-features = false }
+# librespot's sysinfo 0.36 calls libc::proc_pidinfo on iOS; libc >= 0.2.190 limits it to macOS.
+libc = "=0.2.189"
 
 [dev-dependencies]
 nsh-engine = "=0.6.0"
