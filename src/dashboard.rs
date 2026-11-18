@@ -109,6 +109,17 @@ fn format_remaining(total_secs: i64) -> String {
     }
 }
 
+/// "4-second", "15-minute", "1:30:00" for the alert's "Your … timer has finished".
+fn describe_duration(total_secs: i64) -> String {
+    let (h, m, s) = split_hms(total_secs);
+    match (h, m, s) {
+        (0, 0, s) => format!("{s}-second"),
+        (0, m, 0) => format!("{m}-minute"),
+        (h, 0, 0) => format!("{h}-hour"),
+        _ => format_remaining(total_secs),
+    }
+}
+
 /// `(hours, minutes, seconds)` of a duration.
 fn split_hms(total_secs: i64) -> (i64, i64, i64) {
     let t = total_secs.clamp(0, MAX_SECS);
@@ -467,7 +478,7 @@ fn night_dim_toggle(night_dim: Signal<bool>) -> impl IntoElement {
 // ---------------------------------------------------------------------------------------------
 
 /// The one header control for the timer, which also closes the panel (there is no Close button):
-/// idle â†’ "Timer" (toggles the panel); running or paused â†’ the remaining time (toggles the panel).
+/// idle: "Timer" (toggles the panel); running or paused: the remaining time (toggles the panel).
 /// When the time runs out the full-screen `timer_alert` takes over; the header stays plain.
 fn timer_header_button(
     duration_secs: Signal<i64>,
@@ -903,7 +914,7 @@ fn timer_alert(
     running: Signal<bool>,
     timer_finished: Signal<bool>,
 ) -> impl IntoElement {
-    let set_time = format_remaining(duration_secs.get_untracked());
+    let set_time = describe_duration(duration_secs.get_untracked());
     let can_restart = duration_secs.get_untracked() > 0;
 
     // The whole alert fades in; the ring glows in and out until the alert is gone.
@@ -1275,7 +1286,7 @@ fn awaiting_view(
 
 fn connecting_view() -> impl IntoElement {
     state_column("spotify_connecting").child(
-        text("Connecting to Spotifyâ€¦")
+        text("Connecting to Spotify\u{2026}")
             .text_size(px(28.0))
             .font_weight(FontWeight::MEDIUM)
             .text_color(rgba(FAINT)),
@@ -1992,6 +2003,26 @@ mod tests {
         assert!(!app.screen().enabled("id:spotify_sign_in").unwrap());
         app.type_text("id:spotify_password", "pw").unwrap();
         assert!(app.screen().enabled("id:spotify_sign_in").unwrap());
+    }
+
+    /// Regression: signing in disposes the form, which used to cancel the session task before it
+    /// ran, leaving "Connecting to Spotify…" forever.
+    #[test]
+    fn sign_in_starts_the_session_task_after_the_form_is_gone() {
+        let mut app = start_landscape();
+        app.wait_for("id:spotify_username").unwrap();
+        app.type_text("id:spotify_username", "regression@example.invalid").unwrap();
+        app.type_text("id:spotify_password", "pw").unwrap();
+        app.press("id:spotify_sign_in").unwrap();
+        // Off iOS, librespot refuses login5 at once, so the state moves on to an error quickly.
+        let started = (0..50).any(|_| {
+            if crate::debug_log::text().contains("spotify: session task started") {
+                return true;
+            }
+            let _ = app.wait_for_gone("id:never_there", Duration::from_millis(40));
+            false
+        });
+        assert!(started, "session task never ran:\n{}", crate::debug_log::text());
     }
 
     #[test]

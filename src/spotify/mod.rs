@@ -114,7 +114,10 @@ fn start_session(state: Signal<SpotifyState>, login: session::Login) {
     SESSION.with(|s| *s.borrow_mut() = Some(request_tx.clone()));
     let device_id = observer_device_id();
 
-    spawn(async move {
+    // Detached: the sign-in form that calls this is disposed as soon as the state becomes
+    // `Connecting`, and a task owned by it would be cancelled before it ever ran.
+    Owner::detached().run(move || spawn(async move {
+        dlog::info("spotify: session task started");
         let _worker = background(session::run(login, device_id, event_tx, request_rx));
         while let Some(event) = event_rx.recv().await {
             // Ignore events from a session that has since been replaced or stopped.
@@ -154,7 +157,7 @@ fn start_session(state: Signal<SpotifyState>, login: session::Login) {
                 }
             }
         }
-    });
+    }));
 }
 
 /// Signs in with a Spotify username/email and password through login5. The password is only
