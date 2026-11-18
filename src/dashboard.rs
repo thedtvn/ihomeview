@@ -1192,17 +1192,16 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_shows_clock_music_unavailable_and_camera() {
+    fn dashboard_shows_clock_music_sign_in_and_camera() {
         let mut app = start_landscape();
         app.wait_for("id:clock_time").unwrap();
         app.wait_for("id:camera_status").unwrap();
         app.wait_for("Not configured").unwrap();
         app.wait_for("id:music_status").unwrap();
-        app.wait_for("id:spotify_unavailable").unwrap();
-        app.wait_for("Spotify sign-in is not available in this build yet.").unwrap();
-        // No controls while unavailable.
+        // No saved Spotify login in a fresh app: offer sign-in, no playback controls.
+        app.wait_for("id:spotify_sign_in").unwrap();
         assert_eq!(app.screen().count("id:spotify_play_pause").unwrap(), 0);
-        assert_eq!(app.screen().count("id:spotify_sign_in").unwrap(), 0);
+        assert_eq!(app.screen().count("id:spotify_unavailable").unwrap(), 0);
     }
 
     #[test]

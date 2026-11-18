@@ -10,6 +10,22 @@ publish = false
 nsh-core = "=0.6.0"
 nsh-base = "=0.6.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Experimental Spotify Connect remote (see src/spotify/README.md). No playback/audio crates.
+librespot-core = { version = "=0.8.0", default-features = false, features = ["native-tls"] }
+librespot-oauth = { version = "=0.8.0", default-features = false, features = ["native-tls"] }
+librespot-protocol = "=0.8.0"
+protobuf = "3.7"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "time", "rt", "macros", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+url = "2"
+hex = "0.4"
+log = "0.4"
 
 [dev-dependencies]
 nsh-engine = "=0.6.0"

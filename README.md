@@ -1,53 +1,53 @@
 # ihomeview
 
-A native, iPad-only desk dashboard built in Rust with [Native Shell](https://nsh.dev/).
+A native desk dashboard for an old iPad, written in Rust with [Native Shell](https://nsh.dev/) (UIKit views, no WebView or JavaScript runtime).
 
-## Target
+- Large clock and date, 12/24-hour switch and night dimming.
+- A focus timer that stays hidden until you open it.
+- A music card for Spotify (experimental, see below).
 
-- iPad Air 2 (`iPad5,4`), arm64, iPadOS 15.8.7.
-- Install an unsigned IPA through TrollStore; no Apple Developer signing account.
-- No browser renderer, localhost server, or PC/NAS companion at runtime.
-- Private GitHub repository; macOS GitHub Actions builds use the owner's GitHub account and available runner allowance.
+## Requirements
 
-## First milestone
+- An arm64 iPad on iPadOS 15 or newer. Developed on an iPad Air 2 (`iPad5,4`) with iPadOS 15.8.7.
+- [TrollStore](https://github.com/opa334/TrollStore) to install the unsigned IPA. No Apple Developer account is used.
 
-Native clock/date, focus timer, display preferences, and clearly labelled music/camera setup states. Live weather, calendar access, camera streams, and remote PC notifications are not implemented by the first milestone.
+## Install
 
-## Spotify boundary
+Download `ihomeview-ipad-arm64` from the latest successful [GitHub Actions run](../../actions/workflows/ios.yml), unzip it, check `ihomeview.ipa` against `ihomeview.ipa.sha256`, and open the IPA with TrollStore.
 
-The desired behavior is to **keep playback on the Windows PC** while controlling it from this iPad. Spotify Premium is available. The user requested librespot; it must not silently transfer playback to the iPad or substitute a desktop companion.
+## Spotify (experimental)
 
-librespot is an unofficial Spotify client primarily designed to implement a Connect playback device. Its documented local-player commands do not establish general remote control of another active device. Remote playback integration must be proven before controls are presented as working. Until then, music is shown as unavailable/not connected, not simulated.
+The music card is meant to show and control Spotify playing on **another** device, such as a Windows PC with Spotify Premium, without moving playback to the iPad. It uses [librespot](https://github.com/librespot-org/librespot), an unofficial Spotify client, and Spotify's undocumented Spotify Connect messages:
 
-Never commit Spotify credentials, refresh tokens, camera passwords, or authentication callback data. OAuth login, if implemented, must be an explicit user action; no embedded client secret or collection of Spotify passwords.
+- It may stop working whenever Spotify changes its internal services.
+- Using an unofficial client may break Spotify's terms of service; use it at your own risk.
+- Sign-in happens on Spotify's own login page. The app never asks for or stores your password; only a refresh token is stored on the iPad.
 
-## Runtime limitations
+Status and evidence: [docs/spotify-feasibility.md](docs/spotify-feasibility.md) and the [librespot spike](spikes/librespot-remote/README.md).
 
-A standalone dashboard does not make the iPad an Apple Home hub, Windows monitor, or replacement for OS-wide notifications. Optional keep-awake behavior should apply only while the dashboard is visible and restore normal behavior afterward. Low CPU/RAM use is a goal, not a measured claim until verified on the target iPad.
+## Not included
 
-The earlier HTML dashboard was not deployed. Python packages installed during the discarded localhost-hosting investigation are not required by this native app.
+Camera streams, weather, calendar and PC notifications are not implemented. The iPad does not become an Apple Home hub or a Windows display.
 
 ## Build
 
-NSH CLI and crates are pinned to **0.6.0**. Rust dependencies are recorded in `Cargo.lock`.
+Native Shell CLI and crates are pinned to **0.6.0**; Rust dependencies are locked in `Cargo.lock`.
 
-Local logic/UI checks:
+Checks that run on any desktop:
 
 ```sh
 cargo test --locked --lib
 python3 -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
-On macOS with Xcode, the arm64 Rust target, and NSH 0.6.0:
+The IPA must be built on macOS with Xcode, Rust's `aarch64-apple-ios` target and NSH 0.6.0:
 
 ```sh
 bash scripts/build-ios.sh
 ```
 
-The private GitHub Actions workflow uses the standard Apple Silicon `macos-15` runner, checks the NSH distribution checksum, tests the app, then packages the unsigned `.app` inside `Payload/` as `artifacts/ihomeview.ipa`. It uses no Apple signing identity, provisioning profile, or App Store credentials. The artifact is intended for TrollStore only—not normal iOS installation or TestFlight.
+GitHub Actions (`.github/workflows/ios.yml`) runs the same build on the `macos-15` Apple Silicon runner, verifies the NSH download checksum, runs the tests and uploads the unsigned IPA with its SHA-256 and a JSON build report. The packager only checks the IPA's metadata, architecture and minimum OS; a successful build does not prove the app runs on a particular device.
 
-The packager checks iPad support, the arm64 executable, minimum OS metadata and Mach-O deployment target; it emits a SHA-256 file and a JSON evidence report. Its unit tests use synthetic fixtures and mocked macOS tools, not a real IPA. A successful package check does not prove the app launches on iPadOS 15.
+## License
 
-## Build status
-
-Native views compile on the Windows desktop. `cargo test --locked --lib` passes six tests, including headless checks for the honest music/camera states and timer reset. No iOS build or device installation has been verified yet.
+[MIT](LICENSE) © The DT
