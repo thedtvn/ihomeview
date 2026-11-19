@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use crate::debug_log as dlog;
 
 use super::{
-    Playback, PlaylistSummary,
+    Playback, PlaylistSummary, SaveTrackState,
     connect::{self, RemoteCommand, TrackInfo},
 };
 
@@ -53,6 +53,7 @@ pub enum Event {
     RefreshToken(String),
     /// The user's playlists for quick play (Liked Songs first).
     Playlists(Vec<PlaylistSummary>),
+    SaveState { state: SaveTrackState, mutation: bool },
     Playback(Playback),
     /// A recoverable error with a short user-facing message.
     Error(String),
@@ -64,6 +65,9 @@ pub enum Event {
 #[derive(Debug)]
 pub enum Request {
     Command(RemoteCommand),
+    SetVolume(u8),
+    InspectSaved(String),
+    SaveTrack { track_uri: String, destinations: Vec<String> },
     Stop,
 }
 
@@ -167,6 +171,8 @@ async fn load_playlists(session: &Session) -> Result<Vec<PlaylistSummary>, Strin
         uri: format!("spotify:user:{}:collection", session.username()),
         name: "Liked Songs".into(),
         image_url: None,
+        can_add_tracks: true,
+        song_count: None,
     }];
     let contents = root.contents.as_ref();
     let items = contents.map(|c| c.items.as_slice()).unwrap_or_default();
@@ -176,18 +182,7 @@ async fn load_playlists(session: &Session) -> Result<Vec<PlaylistSummary>, Strin
         if !uri.starts_with("spotify:playlist:") {
             continue; // folders are "spotify:start-group/end-group"
         }
-        let attrs = metas.get(i).and_then(|m| m.attributes.as_ref());
-        let name = attrs.and_then(|a| a.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| "Playlist".into());
-        let image_url = attrs.and_then(|a| {
-            a.picture_size
-                .iter()
-                .find(|p| p.target_name.as_deref() == Some("default"))
-                .or_else(|| a.picture_size.first())
-                .and_then(|p| p.url.clone())
-                .filter(|u| u.starts_with("https://"))
-                .or_else(|| a.picture.as_ref().filter(|p| p.len() == 20).map(|p| format!("https://i.scdn.co/image/{}", hex::encode(p))))
-        });
-        out.push(PlaylistSummary { uri, name, image_url });
+        out.push(super::library::playlist_summary(&uri, metas.get(i)));
     }
     Ok(out)
 }
@@ -345,6 +340,8 @@ pub async fn run(
     let mut last_active: Option<String> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut last_sent: Option<Playback> = None;
+    // Library reads/writes must not block dealer messages, transport commands or Stop.
+    let mut library_jobs = tokio::task::JoinSet::new();
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let _ = events.send(Event::Playback(Playback::default()));
 
@@ -418,6 +415,44 @@ pub async fn run(
             request = requests.recv() => {
                 match request {
                     None | Some(Request::Stop) => break,
+                    Some(Request::SetVolume(percent)) => {
+                        let target = observed.cluster.as_ref()
+                            .map(|c| c.active_device_id.as_str())
+                            .filter(|id| !id.is_empty())
+                            .or(last_active.as_deref());
+                        let result = match target {
+                            Some(target) if registered && target != device_id => {
+                                match observed.cluster.as_ref().and_then(|c| c.device.get(target)) {
+                                    Some(d) if !d.capabilities.as_ref().is_some_and(|c| c.disable_volume) => {
+                                        let msg = librespot::protocol::connect::SetVolumeCommand {
+                                            volume: connect::volume_raw(percent), ..Default::default()
+                                        };
+                                        let path = format!("/connect-state/v1/connect/volume/from/{device_id}/to/{target}");
+                                        session.spclient().request_with_protobuf(&Method::PUT, &path, None, &msg)
+                                            .await.map(|_| ()).map_err(short)
+                                    }
+                                    _ => Err("This Spotify device does not support remote volume.".into()),
+                                }
+                            }
+                            _ => Err("No remote Spotify device to change volume on.".into()),
+                        };
+                        match result {
+                            Ok(()) => dlog::info(format!("remote volume: {percent}%")),
+                            Err(e) => { let _ = events.send(Event::Error(format!("Volume failed ({e})."))); }
+                        }
+                    }
+                    Some(Request::InspectSaved(track_uri)) => {
+                        let reader = session.clone();
+                        library_jobs.spawn(async move {
+                            (super::library_io::inspect_saved(&reader, &track_uri).await, false)
+                        });
+                    }
+                    Some(Request::SaveTrack { track_uri, destinations }) => {
+                        let writer = session.clone();
+                        library_jobs.spawn(async move {
+                            (super::library_io::save_track(&writer, &track_uri, &destinations).await, true)
+                        });
+                    }
                     Some(Request::Command(cmd)) => {
                         dlog::info(format!("command {cmd:?}"));
                         // After a pause Spotify clears the active device; the device that was
@@ -440,6 +475,13 @@ pub async fn run(
                     }
                 }
             }
+            result = library_jobs.join_next(), if !library_jobs.is_empty() => {
+                match result {
+                    Some(Ok((state, mutation))) => { let _ = events.send(Event::SaveState { state, mutation }); }
+                    Some(Err(e)) => dlog::error(format!("library task stopped: {e}")),
+                    None => {}
+                }
+            }
             _ = tick.tick() => {
                 if session.is_invalid() {
                     let _ = events.send(ended(Some("Spotify session ended.".into()), false));
@@ -459,7 +501,13 @@ pub async fn run(
         }
         // Only wake the UI when something it shows changed. While playing, progress moves every
         // second; while paused nothing changes, so the card is not re-rendered (battery).
-        let pb = observed.playback(&device_id);
+        let mut pb = observed.playback(&device_id);
+        if let Some(d) = last_active.as_deref().and_then(|id| observed.cluster.as_ref()?.device.get(id)) {
+            if pb.volume_percent.is_none() {
+                pb.volume_percent = Some(connect::volume_percent(d.volume));
+                pb.can_set_volume = !d.capabilities.as_ref().is_some_and(|c| c.disable_volume);
+            }
+        }
         if last_sent.as_ref() != Some(&pb) {
             let _ = events.send(Event::Playback(pb.clone()));
             last_sent = Some(pb);

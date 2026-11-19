@@ -15,6 +15,8 @@ use tokio::sync::mpsc;
 use crate::debug_log as dlog;
 
 pub mod connect;
+mod library;
+mod library_io;
 mod session;
 
 /// Connection and playback state shown by the dashboard.
@@ -56,6 +58,11 @@ pub struct Playback {
     pub repeat: RepeatMode,
     /// The playing context (playlist/album) URI, when Spotify reports one.
     pub context_uri: Option<String>,
+    /// Spotify URI of the loaded track; saving uses this snapshot, not a later track.
+    pub track_uri: Option<String>,
+    /// The active/last remote device volume, 0..=100; None when not reported.
+    pub volume_percent: Option<u8>,
+    pub can_set_volume: bool,
 }
 
 /// Repeat state of the active device.
@@ -88,6 +95,33 @@ pub struct PlaylistSummary {
     pub name: String,
     /// HTTPS cover image, when the playlist has one.
     pub image_url: Option<String>,
+    /// True only for editable playlists (and Liked Songs), never Spotify DJ.
+    pub can_add_tracks: bool,
+    pub song_count: Option<u32>,
+}
+
+pub const DJ_PLAYLIST_ID: &str = "37i9dQZF1EYkqdzj48dyYq";
+
+impl PlaylistSummary {
+    pub fn is_dj(&self) -> bool {
+        self.uri == format!("spotify:playlist:{DJ_PLAYLIST_ID}")
+    }
+
+    pub fn is_liked_songs(&self) -> bool {
+        self.uri.ends_with(":collection")
+    }
+}
+
+/// State of the add-to-playlist sheet. Requests refer to a snapshot of the track URI.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SaveTrackState {
+    pub track_uri: String,
+    pub loading: bool,
+    pub busy: bool,
+    /// Playlist/collection URIs already containing the track (do not add duplicates).
+    pub saved_in: Vec<String>,
+    pub error: Option<String>,
+    pub notice: Option<String>,
 }
 
 /// User actions sent from the dashboard to the backend.
@@ -105,6 +139,8 @@ pub enum SpotifyCommand {
     CycleRepeat,
     /// Jump to this position in the current track, in milliseconds.
     SeekTo(u64),
+    /// Volume of the remote playback device, NOT this iPad, 0..=100.
+    SetVolume(u8),
 }
 
 const KEY_USERNAME: &str = "spotify.username";
@@ -235,6 +271,14 @@ fn start_session_keeping(state: Signal<SpotifyState>, login: session::Login, kee
                     let _ = Storage::set_item(KEY_USERNAME, username);
                     let _ = Storage::set_item(KEY_CREDENTIALS, BASE64.encode(auth_data));
                 }
+                session::Event::SaveState { state: result, mutation } => {
+                    // A late membership read cannot overwrite an in-progress save or the status
+                    // of a different track's sheet.
+                    let current = save_state().get_untracked();
+                    if current.track_uri == result.track_uri && (!current.busy || mutation) {
+                        save_state().set(result);
+                    }
+                }
                 session::Event::Playlists(list) => playlists().set(list),
                 session::Event::RefreshToken(token) => {
                     dlog::info("spotify: saving rotated refresh token");
@@ -256,6 +300,18 @@ fn start_session_keeping(state: Signal<SpotifyState>, login: session::Login, kee
                 }
                 session::Event::Ended { message, signed_out } => {
                     SESSION.with(|s| *s.borrow_mut() = None);
+                    let pending = save_state().get_untracked();
+                    if pending.busy || pending.loading {
+                        save_state().update(|s| {
+                            s.loading = false;
+                            s.busy = false;
+                            s.error = Some(if pending.busy {
+                                "Connection lost during save. Check Spotify before retrying.".into()
+                            } else {
+                                "Connection lost while checking saved songs. Reopen this menu to retry.".into()
+                            });
+                        });
+                    }
                     if signed_out {
                         // That way in is dead; keep the other one (stored credential vs refresh).
                         Storage::remove_item(KEY_CREDENTIALS);
@@ -377,6 +433,8 @@ pub fn send(state: Signal<SpotifyState>, command: SpotifyCommand) {
             dlog::info("spotify: sign out");
             stop_session();
             forget_login();
+            playlists().set(Vec::new());
+            save_state().set(SaveTrackState::default());
             state.set(SpotifyState::SignedOut);
         }
         _ => {
@@ -391,6 +449,10 @@ pub fn send(state: Signal<SpotifyState>, command: SpotifyCommand) {
                 SpotifyCommand::PlayPause => connect::RemoteCommand::Resume,
                 SpotifyCommand::ToggleShuffle => connect::RemoteCommand::SetShuffle(next_shuffle(&playback)),
                 SpotifyCommand::CycleRepeat => connect::RemoteCommand::SetRepeat(playback.repeat.next()),
+                SpotifyCommand::SetVolume(percent) => {
+                    send_request(session::Request::SetVolume(percent.min(100)));
+                    return;
+                }
                 SpotifyCommand::SeekTo(ms) => connect::RemoteCommand::SeekTo(ms),
                 SpotifyCommand::SignIn | SpotifyCommand::SignOut => return,
             };
@@ -420,6 +482,7 @@ fn send_request(request: session::Request) {
 thread_local! {
     /// The user's playlists for quick play (filled once connected; empty until then).
     static PLAYLISTS: RefCell<Option<Signal<Vec<PlaylistSummary>>>> = const { RefCell::new(None) };
+    static SAVE_STATE: RefCell<Option<Signal<SaveTrackState>>> = const { RefCell::new(None) };
 }
 
 /// The user's playlists (Liked Songs first), loaded after connecting. Call from a component;
@@ -434,4 +497,48 @@ pub fn playlists() -> Signal<Vec<PlaylistSummary>> {
 pub fn play_context(uri: &str) {
     dlog::info(format!("spotify: play context {uri}"));
     send_request(session::Request::Command(connect::RemoteCommand::PlayContext(uri.to_owned())));
+}
+
+/// Shared status for the current add-to-playlist sheet.
+pub fn save_state() -> Signal<SaveTrackState> {
+    SAVE_STATE.with(|s| {
+        *s.borrow_mut().get_or_insert_with(|| Owner::detached().run(|| signal(SaveTrackState::default())))
+    })
+}
+
+fn connected_request(request: session::Request) -> bool {
+    SESSION.with(|s| s.borrow().as_ref().is_some_and(|tx| tx.send(request).is_ok()))
+}
+
+/// Loads membership for a snapshot of the current track. No changes to the user's library.
+pub fn inspect_saved_track(track_uri: &str) {
+    let state = save_state();
+    state.set(SaveTrackState { track_uri: track_uri.to_owned(), loading: true, ..Default::default() });
+    if !connected_request(session::Request::InspectSaved(track_uri.to_owned())) {
+        state.update(|s| { s.loading = false; s.error = Some("Connect to Spotify first.".into()); });
+    }
+}
+
+/// Adds the snapshot track to the chosen destinations, never DJ and never a read-only playlist.
+/// Existing membership is left alone. Only the backend's confirmed response sets success.
+pub fn save_track_to(track_uri: &str, destinations: Vec<String>) {
+    let status = save_state();
+    if status.get_untracked().busy { return; }
+    let allowed = playlists().get_untracked();
+    let mut targets = Vec::new();
+    for uri in destinations {
+        if !allowed.iter().any(|p| p.uri == uri && p.can_add_tracks && !p.is_dj()) {
+            status.update(|s| s.error = Some("That playlist cannot be edited.".into()));
+            return;
+        }
+        if !targets.contains(&uri) { targets.push(uri); }
+    }
+    if !library::track_uri_is_valid(track_uri) || targets.is_empty() {
+        status.update(|s| s.error = Some("Choose a track and at least one playlist.".into()));
+        return;
+    }
+    status.update(|s| { s.busy = true; s.error = None; s.notice = None; });
+    if !connected_request(session::Request::SaveTrack { track_uri: track_uri.to_owned(), destinations: targets }) {
+        status.update(|s| { s.busy = false; s.error = Some("Connect to Spotify first.".into()); });
+    }
 }

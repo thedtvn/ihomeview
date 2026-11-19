@@ -11,13 +11,16 @@
 //! No continuous animation and no blur; the only repeating work is the clock tick and, while a
 //! timer runs, its 250 ms deadline check. Pure NSH Rust UI, no WebView.
 
+use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::{Datelike, Local, Timelike};
 use nsh_base::theme;
 use nsh_core::{Checked, prelude::*, time::unix_ms};
 
-use crate::spotify::{self, Playback, PlaylistSummary, RepeatMode, SpotifyCommand, SpotifyState};
+use crate::spotify::{
+    self, Playback, PlaylistSummary, RepeatMode, SaveTrackState, SpotifyCommand, SpotifyState,
+};
 
 /// Focus timer presets, in minutes.
 const PRESETS_MIN: [i64; 4] = [5, 15, 25, 45];
@@ -244,15 +247,26 @@ pub fn Dashboard() -> impl IntoElement {
     // Spotify: the backend owns the state, the UI only reads it and sends commands.
     let spotify_state = signal(SpotifyState::SignedOut);
     spotify::start(spotify_state);
-    dashboard_content(spotify_state, spotify::playlists(), false)
+    dashboard_content(spotify_state, spotify::playlists(), MusicHooks::live(spotify_state), false)
 }
 
 /// The whole screen for a given Spotify state and playlist list (the tests drive it directly).
 fn dashboard_content(
     spotify_state: Signal<SpotifyState>,
     playlists: Signal<Vec<PlaylistSummary>>,
+    hooks: MusicHooks,
     timer_initially_open: bool,
 ) -> impl IntoElement {
+    // The add-to-playlist sheet closes if Spotify goes away under it (sign out, error).
+    let add_target = hooks.target;
+    let connected = computed(move || spotify_kind(&spotify_state.get()) == 4);
+    effect(move || {
+        if !connected.get() && add_target.get_untracked().is_some() {
+            add_target.set(None);
+        }
+    });
+    let sheet_hooks = hooks.clone();
+
     // Clock: one tick per second, aligned just after each second boundary (battery: half the
     // wakeups of a 500ms poll, and the display only changes once a second anyway).
     // The task ends with this view, per https://nsh.dev/docs/reactivity.md#cleanup.
@@ -358,7 +372,7 @@ fn dashboard_content(
                         view()
                             .gap(px(20.0))
                             .style_when(is_landscape, |s| s.flex_1().flex_row().min_h(px(0.0)))
-                            .child(music_card(spotify_state, playlists))
+                            .child(music_card(spotify_state, playlists, hooks))
                             .child(when(timer_open, move || {
                                 focus_timer_panel(duration_secs, remaining_secs, running)
                             })),
@@ -367,6 +381,9 @@ fn dashboard_content(
         )
         .child(when(settings_open, move || {
             settings_menu(settings_open, night_dim, twelve_hour, debug_open, spotify_state)
+        }))
+        .child(when(move || add_target.get().is_some(), move || {
+            add_sheet(add_target, playlists, sheet_hooks.clone())
         }))
         .child(night_dim_overlay(night_dim))
         .child(when(timer_finished, move || {
@@ -465,6 +482,19 @@ enum Icon {
     RepeatOne,
     Gear,
     Note,
+    /// Liked Songs.
+    Heart,
+    Plus,
+    Check,
+    Search,
+    /// Speaker with no waves and a cross: muted.
+    VolumeOff,
+    /// Speaker with one wave.
+    VolumeLow,
+    /// Speaker with two waves.
+    VolumeHigh,
+    /// Spotify DJ: rings broken into arcs around a dot, drawn in one colour.
+    Dj,
 }
 
 // Path data on a 24x24 grid.
@@ -479,6 +509,15 @@ const PATH_SPARKLE: &str = "M19.5 .5 20.8 3.2 23.5 4.5 20.8 5.8 19.5 8.5 18.2 5.
 const PATH_REPEAT: &str = "M17 2l4 4-4 4 M3 11v-1a4 4 0 0 1 4-4h14 M7 22l-4-4 4-4 M21 13v1a4 4 0 0 1-4 4H3";
 const PATH_ONE: &str = "M10.6 10.2 12.2 9v6";
 const PATH_NOTE: &str = "M10 3v11.4a3.5 3.5 0 1 0 2 3.1V7h6V3z";
+const PATH_HEART: &str = "M12 21 C5 15.4 2 11.8 2 8.2 C2 5.2 4.3 3 7.1 3 C9.1 3 11 4.1 12 5.9 \
+     C13 4.1 14.9 3 16.9 3 C19.7 3 22 5.2 22 8.2 C22 11.8 19 15.4 12 21 Z";
+const PATH_PLUS: &str = "M12 5v14 M5 12h14";
+const PATH_CHECK: &str = "M5 12.8l4.6 4.6L19 7.6";
+const PATH_SEARCH: &str = "M10.5 3.5a7 7 0 1 0 0 14 7 7 0 0 0 0-14z M16 16l4.5 4.5";
+const PATH_SPEAKER: &str = "M3 9.5v5h3.8l5.2 4.4V5.1L6.8 9.5z";
+const PATH_WAVE_LOW: &str = "M15.6 9a4.2 4.2 0 0 1 0 6";
+const PATH_WAVE_HIGH: &str = "M18.4 6.2a8 8 0 0 1 0 11.6";
+const PATH_MUTE_CROSS: &str = "M16 9.5l5 5 M21 9.5l-5 5";
 
 fn icon_painter(icon: Icon, size: f32, color: u32) -> Painter {
     let c = rgba(color);
@@ -506,6 +545,30 @@ fn icon_painter(icon: Icon, size: f32, color: u32) -> Painter {
         Icon::Repeat => p.stroke_svg(PATH_REPEAT),
         Icon::RepeatOne => p.stroke_svg(PATH_REPEAT).line_width(1.7_f32).stroke_svg(PATH_ONE),
         Icon::Note => p.fill_svg(PATH_NOTE),
+        Icon::Heart => p.fill_svg(PATH_HEART),
+        Icon::Plus => p.line_width(2.4_f32).stroke_svg(PATH_PLUS),
+        Icon::Check => p.line_width(2.8_f32).stroke_svg(PATH_CHECK),
+        Icon::Search => p.line_width(2.2_f32).stroke_svg(PATH_SEARCH),
+        Icon::VolumeOff => p.fill_svg(PATH_SPEAKER).stroke_svg(PATH_MUTE_CROSS),
+        Icon::VolumeLow => p.fill_svg(PATH_SPEAKER).stroke_svg(PATH_WAVE_LOW),
+        Icon::VolumeHigh => p
+            .fill_svg(PATH_SPEAKER)
+            .stroke_svg(PATH_WAVE_LOW)
+            .stroke_svg(PATH_WAVE_HIGH),
+        Icon::Dj => {
+            // Three broken rings turned against each other, and a solid dot in the middle.
+            let ring = |g: Painter, r: f32, from: f32, to: f32| {
+                g.begin_path().arc(0.0_f32, 0.0_f32, r, deg(from), deg(to)).stroke()
+            };
+            let g = p.translate(12.0_f32, 12.0_f32).line_width(2.1_f32);
+            let g = ring(g, 10.4, 200.0, 330.0);
+            let g = ring(g, 10.4, 20.0, 150.0);
+            let g = ring(g, 7.0, 290.0, 60.0 + 360.0);
+            let g = ring(g, 7.0, 100.0, 250.0);
+            let g = ring(g, 3.9, -30.0, 120.0);
+            let g = ring(g, 3.9, 150.0, 300.0);
+            g.begin_path().arc(0.0_f32, 0.0_f32, 1.1_f32, deg(0.0), deg(360.0)).fill()
+        }
         Icon::Gear => {
             // A ring with eight teeth around it.
             let mut g = p
@@ -1441,7 +1504,47 @@ fn state_column(test_id: &'static str) -> View {
         .py(px(24.0))
 }
 
-fn music_card(spotify_state: Signal<SpotifyState>, playlists: Signal<Vec<PlaylistSummary>>) -> impl IntoElement {
+/// The song the add sheet was opened for. Copied when the plus is tapped: if the track changes
+/// while the sheet is open, saving still refers to this one.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct AddTarget {
+    track_uri: String,
+    title: String,
+}
+
+/// What the Music card needs from outside itself, so the tests can swap in a fake backend.
+#[derive(Clone)]
+struct MusicHooks {
+    /// `Some` while the add-to-playlist sheet is open.
+    target: Signal<Option<AddTarget>>,
+    save: Signal<SaveTrackState>,
+    inspect: Rc<dyn Fn(&str)>,
+    save_to: Rc<dyn Fn(&str, Vec<String>)>,
+    /// Sets the volume of the Spotify device that is playing (never this iPad), 0..=100.
+    set_volume: Rc<dyn Fn(u8)>,
+}
+
+impl MusicHooks {
+    fn live(spotify_state: Signal<SpotifyState>) -> Self {
+        Self {
+            target: signal(None),
+            save: spotify::save_state(),
+            inspect: Rc::new(|uri: &str| spotify::inspect_saved_track(uri)),
+            save_to: Rc::new(|uri: &str, to: Vec<String>| spotify::save_track_to(uri, to)),
+            set_volume: Rc::new(move |v: u8| spotify::send(spotify_state, SpotifyCommand::SetVolume(v))),
+        }
+    }
+}
+
+fn is_track_uri(uri: &str) -> bool {
+    uri.strip_prefix("spotify:track:").is_some_and(|id| !id.is_empty())
+}
+
+fn music_card(
+    spotify_state: Signal<SpotifyState>,
+    playlists: Signal<Vec<PlaylistSummary>>,
+    hooks: MusicHooks,
+) -> impl IntoElement {
     let kind = computed(move || spotify_kind(&spotify_state.get()));
     let playback = computed(move || match spotify_state.get() {
         SpotifyState::Connected(p) => p,
@@ -1486,7 +1589,7 @@ fn music_card(spotify_state: Signal<SpotifyState>, playlists: Signal<Vec<Playlis
                     1 => signed_out_view(spotify_state).into_element(),
                     2 => awaiting_view(spotify_state, approval).into_element(),
                     3 => connecting_view().into_element(),
-                    4 => connected_view(spotify_state, playback, playlists).into_element(),
+                    4 => connected_view(spotify_state, playback, playlists, hooks.clone()).into_element(),
                     _ => error_view(spotify_state, message).into_element(),
                 })),
         )
@@ -1642,6 +1745,7 @@ fn connected_view(
     spotify_state: Signal<SpotifyState>,
     playback: Memo<Playback>,
     playlists: Signal<Vec<PlaylistSummary>>,
+    hooks: MusicHooks,
 ) -> impl IntoElement {
     let has_track = computed(move || playback.get().title.is_some());
     let artwork = computed(move || playback.get().artwork_url);
@@ -1691,13 +1795,23 @@ fn connected_view(
                                     .text_color(rgba(GREEN)),
                             )
                             .child(
-                                text(move || playback.get().title.unwrap_or_default())
-                                    .test_id("spotify_title")
-                                    .text_size(move || if narrow() { px(28.0) } else { px(40.0) })
-                                    .line_height(move || if narrow() { px(33.0) } else { px(46.0) })
-                                    .font_weight(FontWeight::BOLD)
-                                    .number_of_lines(2)
-                                    .text_color(white()),
+                                // Title with the "add to a playlist" plus beside it.
+                                view()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(12.0))
+                                    .child(
+                                        view().flex_1().min_w(px(0.0)).child(
+                                            text(move || playback.get().title.unwrap_or_default())
+                                                .test_id("spotify_title")
+                                                .text_size(move || if narrow() { px(28.0) } else { px(40.0) })
+                                                .line_height(move || if narrow() { px(33.0) } else { px(46.0) })
+                                                .font_weight(FontWeight::BOLD)
+                                                .number_of_lines(2)
+                                                .text_color(white()),
+                                        ),
+                                    )
+                                    .child(add_button(playback, hooks.clone())),
                             )
                             .child(
                                 text(move || playback.get().artists.unwrap_or_default())
@@ -1714,7 +1828,8 @@ fn connected_view(
                                     .text_color(rgba(FAINT)),
                             )
                             .child(progress_block(spotify_state, playback))
-                            .child(transport_row(spotify_state, playback)),
+                            .child(transport_row(spotify_state, playback))
+                            .child(volume_row(playback, hooks.clone())),
                     )
             })
             .otherwise(move || {
@@ -2065,12 +2180,750 @@ fn playlist_cover(playback: Memo<Playback>, item: ReadSignal<PlaylistSummary>) -
         .items_center()
         .justify_center()
         .active(|s| s.opacity(0.7))
-        .child(when(move || item.get().image_url.is_some(), move || {
-            image(move || item.get().image_url.unwrap_or_default())
-                .size(px(PLAYLIST_COVER_PT - 4.0))
+        .child(playlist_tile(item, PLAYLIST_COVER_PT - 4.0, false))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Playlist tiles: the cover when Spotify has one, otherwise something readable (never a note).
+// ---------------------------------------------------------------------------------------------
+
+/// Background pairs (from, to) for tiles that only have a name. Dark enough for white text.
+const TILE_COLORS: [(u32, u32); 6] = [
+    (0x3b5bdbff, 0x233a99ff),
+    (0x7048e8ff, 0x4527a0ff),
+    (0xc2255cff, 0x7d1238ff),
+    (0xd9480fff, 0x8f2d06ff),
+    (0x2b8a3eff, 0x14532aff),
+    (0x0c8599ff, 0x08525fff),
+];
+
+/// A steady colour per playlist, so the same playlist always looks the same.
+fn tile_colors(seed: &str) -> (u32, u32) {
+    let mut h: u32 = 0x811c9dc5;
+    for b in seed.bytes() {
+        h = (h ^ b as u32).wrapping_mul(0x01000193);
+    }
+    TILE_COLORS[(h as usize) % TILE_COLORS.len()]
+}
+
+/// Up to three capital letters for a long name: "Chill Lofi Study Beats" is "CLS"; one long
+/// word gives its first three letters.
+fn initials(name: &str) -> String {
+    let words: Vec<&str> = name.split_whitespace().collect();
+    let letters = |w: &str| w.chars().filter(|c| c.is_alphanumeric()).collect::<Vec<char>>();
+    let mut out: String = if words.len() <= 1 {
+        words.first().map(|w| letters(w)).unwrap_or_default().into_iter().take(3).flat_map(char::to_uppercase).collect()
+    } else {
+        words
+            .iter()
+            .filter_map(|w| letters(w).first().copied())
+            .take(3)
+            .flat_map(char::to_uppercase)
+            .collect()
+    };
+    if out.is_empty() {
+        out = name.trim().chars().take(2).collect();
+    }
+    if out.is_empty() {
+        out = "?".to_string();
+    }
+    out
+}
+
+/// The text for a playlist that has no cover: the name itself when it fits two short lines
+/// (`false`), otherwise its initials (`true`).
+fn short_label(name: &str) -> (String, bool) {
+    const LINE: usize = 9;
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        return ("?".to_string(), true);
+    }
+    let (mut lines, mut used) = (1, 0);
+    for word in name.split(' ') {
+        let n = word.chars().count();
+        if n > LINE {
+            return (initials(&name), true);
+        }
+        if used == 0 {
+            used = n;
+        } else if used + 1 + n <= LINE {
+            used += 1 + n;
+        } else {
+            lines += 1;
+            used = n;
+        }
+    }
+    if lines <= 2 { (name, false) } else { (initials(&name), true) }
+}
+
+/// What a playlist looks like inside a `side` x `side` square. Liked Songs is always a heart,
+/// Spotify DJ always its blue and green tile, a playlist with a cover shows it, and one without
+/// shows its short name. `compact` (small tiles that sit beside the full name) uses initials.
+fn playlist_tile(item: ReadSignal<PlaylistSummary>, side: f32, compact: bool) -> impl IntoElement {
+    dynamic(move || {
+        let p = item.get();
+        if p.is_liked_songs() {
+            liked_tile(side).into_element()
+        } else if p.is_dj() {
+            dj_tile(side, p.image_url).into_element()
+        } else if let Some(url) = p.image_url.clone() {
+            image(url)
+                .size(px(side))
+                .flex_shrink_0()
                 .accessibility_elements_hidden(true)
+                .into_element()
+        } else {
+            name_tile(&p, side, compact).into_element()
+        }
+    })
+}
+
+fn liked_tile(side: f32) -> View {
+    view()
+        .test_id("playlist_tile_liked")
+        .size(px(side))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .bg_linear(deg(135.0))
+        .gradient_from(rgba(0x450af5ff))
+        .gradient_to(rgba(0x8e8ee5ff))
+        .accessibility_elements_hidden(true)
+        .child(icon(|| Icon::Heart, side * 0.44, || 0xffffffff))
+}
+
+/// Spotify's DJ cover: a blue square with a green circular glyph and a small "DJ". An official
+/// cover from Spotify (`image_url`) is drawn on top of it; the tile shows if that never loads.
+fn dj_tile(side: f32, cover: Option<String>) -> View {
+    view()
+        .test_id("playlist_tile_dj")
+        .size(px(side))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .bg_linear(deg(160.0))
+        .gradient_from(rgba(0x2d5bffff))
+        .gradient_to(rgba(0x0a2bb8ff))
+        .accessibility_elements_hidden(true)
+        .child(icon(|| Icon::Dj, side * 0.74, || GREEN))
+        .child(
+            text("DJ")
+                .absolute()
+                .left(px(side * 0.09))
+                .bottom(px(side * 0.06))
+                .text_size(px((side * 0.16).max(9.0)))
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgba(GREEN)),
+        )
+        .child(when(cover.is_some(), move || {
+            image(cover.clone().unwrap_or_default())
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size(px(side))
+        }))
+}
+
+fn name_tile(p: &PlaylistSummary, side: f32, compact: bool) -> View {
+    let (label, is_initials) = if compact { (initials(&p.name), true) } else { short_label(&p.name) };
+    let (from, to) = tile_colors(&p.uri);
+    let size = if is_initials { side * 0.34 } else { (side * 0.19).max(11.0) };
+    view()
+        .test_id("playlist_tile_name")
+        .size(px(side))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .px(px(side * 0.07))
+        .bg_linear(deg(135.0))
+        .gradient_from(rgba(from))
+        .gradient_to(rgba(to))
+        .accessibility_elements_hidden(true)
+        .child(
+            text(label)
+                .text_center()
+                .number_of_lines(2)
+                .text_size(px(size))
+                .line_height(px(size * 1.15))
+                .font_weight(FontWeight::BOLD)
+                .text_color(white()),
+        )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Volume of the Spotify device that is playing (not this iPad's speaker).
+// ---------------------------------------------------------------------------------------------
+
+fn volume_icon(percent: u8) -> Icon {
+    match percent {
+        0 => Icon::VolumeOff,
+        1..=49 => Icon::VolumeLow,
+        _ => Icon::VolumeHigh,
+    }
+}
+
+/// Volume in percent for a touch `x` points along a bar `width` wide.
+fn volume_at(x: f32, width: f32) -> u8 {
+    ((x / width.max(1.0)).clamp(0.0, 1.0) * 100.0).round() as u8
+}
+
+/// A slider for the active Spotify device's volume. Dragging only previews; the volume is sent
+/// once, when the finger lifts (a tap works too). Hidden when the device cannot change volume.
+fn volume_row(playback: Memo<Playback>, hooks: MusicHooks) -> impl IntoElement {
+    const HIT_H: f32 = 36.0;
+    const TRACK_H: f32 = 6.0;
+    const THUMB: f32 = 18.0;
+    let supported = computed(move || playback.get().can_set_volume);
+    let set_volume = hooks.set_volume;
+    when(move || supported.get(), move || {
+        let set_volume = set_volume.clone();
+        let width = signal(0.0_f32);
+        // The value under the finger while it is down.
+        let scrub = signal(None::<u8>);
+        // After letting go: the value shown until the device reports it (or time runs out).
+        let landed = signal(None::<(u8, f64)>);
+        let start_x = stored(0.0_f32);
+        effect(move || {
+            let p = playback.get();
+            if let Some((target, deadline)) = landed.get_untracked() {
+                if p.volume_percent.is_some_and(|v| v.abs_diff(target) <= 1) || unix_ms() > deadline {
+                    landed.set(None);
+                }
+            }
+        });
+        let shown = move || {
+            scrub
+                .get()
+                .or_else(|| landed.get().map(|(v, _)| v))
+                .or_else(|| playback.get().volume_percent)
+        };
+        let frac = move || shown().map_or(0.0, |v| v as f32 / 100.0);
+        let send = {
+            let set_volume = set_volume.clone();
+            move |v: u8| {
+                let v = v.min(100);
+                landed.set(Some((v, unix_ms() + 4_000.0)));
+                set_volume(v);
+            }
+        };
+        let send_for_release = send.clone();
+        let step = move |delta: i32| {
+            let now = shown().unwrap_or(0) as i32;
+            send((now + delta).clamp(0, 100) as u8);
+        };
+        view()
+            .test_id("spotify_volume_row")
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(icon(
+                move || volume_icon(shown().unwrap_or(0)),
+                22.0,
+                move || if scrub.get().is_some() { GREEN } else { 0xffffffb3 },
+            ))
+            .child(
+                view()
+                    .test_id("spotify_volume")
+                    .role(AccessibilityRole::Adjustable)
+                    .label(move || match playback.get().device {
+                        Some(d) => format!("Volume on {d}"),
+                        None => "Volume of the playing device".to_string(),
+                    })
+                    .hint("Changes the volume of the device that is playing, not this iPad")
+                    .accessibility_value(move || {
+                        Some(nsh_core::AccessibilityValue {
+                            text: Some(
+                                shown().map_or("Unknown".to_string(), |v| format!("{v} percent")).into(),
+                            ),
+                            ..nsh_core::AccessibilityValue::default()
+                        })
+                    })
+                    .accessibility_actions(vec![
+                        nsh_core::AccessibilityActionDef { name: "increment".into(), label: None },
+                        nsh_core::AccessibilityActionDef { name: "decrement".into(), label: None },
+                    ])
+                    .on_accessibility_action(move |action: &str| match action {
+                        "increment" => step(5),
+                        "decrement" => step(-5),
+                        _ => {}
+                    })
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h(px(HIT_H))
+                    .justify_center()
+                    .on_layout(move |b: &Bounds<Points>| width.set(b.size.width.0))
+                    .claim_touches(TouchClaim::on_start())
+                    .keep_touches(true)
+                    .on_responder_grant(move |e: &ResponderEvent| {
+                        start_x.replace(e.location.x.0);
+                        scrub.set(Some(volume_at(e.location.x.0, width.get_untracked())));
+                    })
+                    .on_responder_move(move |e: &ResponderEvent| {
+                        if scrub.get_untracked().is_some() {
+                            scrub.set(Some(volume_at(start_x.get() + e.gesture.delta.x.0, width.get_untracked())));
+                        }
+                    })
+                    .on_responder_release(move |_: &ResponderEvent| {
+                        if let Some(v) = scrub.get_untracked() {
+                            scrub.set(None);
+                            send_for_release(v);
+                        }
+                    })
+                    .on_responder_terminate(move |_: &ResponderEvent| scrub.set(None))
+                    .child(
+                        view()
+                            .h(px(TRACK_H))
+                            .rounded_full()
+                            .overflow_hidden()
+                            .bg(rgba(0xffffff22))
+                            .child(
+                                view()
+                                    .h(px(TRACK_H))
+                                    .rounded_full()
+                                    .bg(move || if scrub.get().is_some() { rgba(GREEN) } else { rgba(0xffffffd9) })
+                                    .w(move || relative(frac())),
+                            ),
+                    )
+                    .child(
+                        view()
+                            .absolute()
+                            .top(px((HIT_H - THUMB) / 2.0))
+                            .left(move || relative(frac()))
+                            .ml(px(-THUMB / 2.0))
+                            .size(px(THUMB))
+                            .rounded_full()
+                            .bg(white())
+                            .opacity(move || if scrub.get().is_some() { 1.0_f32 } else { 0.0_f32 })
+                            .pointer_events(PointerEvents::None)
+                            .accessibility_elements_hidden(true),
+                    ),
+            )
+            .child(
+                view().w(px(44.0)).items_end().child(
+                    text(move || shown().map_or("--".to_string(), |v| format!("{v}%")))
+                        .test_id("spotify_volume_value")
+                        .text_size(px(15.0))
+                        .tabular_nums()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(move || if scrub.get().is_some() { rgba(GREEN) } else { rgba(MUTED) }),
+                ),
+            )
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Add to playlist: a plus beside the title opens a sheet for the song that is playing.
+// ---------------------------------------------------------------------------------------------
+
+/// The round plus next to the title. Off when there is no Spotify track (an ad, a podcast or
+/// nothing loaded).
+fn add_button(playback: Memo<Playback>, hooks: MusicHooks) -> impl IntoElement {
+    let ready = computed(move || playback.get().track_uri.as_deref().is_some_and(is_track_uri));
+    let target = hooks.target;
+    let inspect = hooks.inspect;
+    view()
+        .role(AccessibilityRole::Button)
+        .test_id("spotify_add")
+        .label("Add to playlist or Liked Songs")
+        .hint("Opens a list of your playlists to add this song to")
+        .disabled(move || !ready.get())
+        .opacity(move || if ready.get() { 1.0_f32 } else { 0.35_f32 })
+        .on_press(move || {
+            let p = playback.get_untracked();
+            let Some(uri) = p.track_uri.filter(|u| is_track_uri(u)) else { return };
+            // The sheet keeps this song even if the track changes while it is open.
+            target.set(Some(AddTarget { track_uri: uri.clone(), title: p.title.unwrap_or_default() }));
+            inspect(&uri);
         })
-        .otherwise(|| icon(|| Icon::Note, 30.0, || 0xffffff59)))
+        .size(px(46.0))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_2()
+        .border_color(rgba(0xffffff4d))
+        .active(|s| s.bg(rgba(0xffffff1f)))
+        .child(icon(|| Icon::Plus, 24.0, || 0xffffffff))
+}
+
+/// Playlists a song can be added to: editable ones and Liked Songs, never Spotify DJ.
+fn add_targets(all: &[PlaylistSummary], query: &str) -> Vec<PlaylistSummary> {
+    let q = query.trim().to_lowercase();
+    all.iter()
+        .filter(|p| p.can_add_tracks && !p.is_dj())
+        .filter(|p| q.is_empty() || p.name.to_lowercase().contains(&q))
+        .cloned()
+        .collect()
+}
+
+/// `"1 song"`, `"12 songs"`, or `""` when Spotify did not say.
+fn song_count_text(count: Option<u32>) -> String {
+    match count {
+        Some(1) => "1 song".to_string(),
+        Some(n) => format!("{n} songs"),
+        None => String::new(),
+    }
+}
+
+fn sheet_button(
+    test_id: &'static str,
+    label: impl Fn() -> String + 'static,
+    primary: bool,
+    disabled: impl Fn() -> bool + Copy + 'static,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    let label = Rc::new(label);
+    let label_for_text = label.clone();
+    view()
+        .role(AccessibilityRole::Button)
+        .test_id(test_id)
+        .label(move || label())
+        .disabled(disabled)
+        .opacity(move || if disabled() { 0.5_f32 } else { 1.0_f32 })
+        .on_press(move || on_press())
+        .min_h(px(52.0))
+        .min_w(px(110.0))
+        .px(px(26.0))
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_1()
+        .border_color(if primary { rgba(GREEN) } else { rgba(0xffffff33) })
+        .bg(if primary { rgba(GREEN) } else { rgba(0xffffff0f) })
+        .active(|s| s.opacity(0.75))
+        .child(
+            text(move || label_for_text())
+                .text_size(px(19.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(if primary { rgba(ON_GREEN) } else { rgba(0xffffffff) }),
+        )
+}
+
+/// One playlist in the sheet: cover, name, and a circle on the right. A playlist that already
+/// has the song shows "Saved" and cannot be picked again.
+fn sheet_row(
+    item: ReadSignal<PlaylistSummary>,
+    saved: Memo<Vec<String>>,
+    selected: Signal<Vec<String>>,
+    locked: impl Fn() -> bool + Copy + 'static,
+) -> impl IntoElement {
+    let is_saved = move || saved.get().contains(&item.get().uri);
+    let is_picked = move || selected.get().contains(&item.get().uri);
+    let checked = move || is_saved() || is_picked();
+    view()
+        .role(AccessibilityRole::Checkbox)
+        .test_id("add_sheet_row")
+        .label(move || item.get().name)
+        .hint(move || if is_saved() { "Already added".to_string() } else { "Tap to choose".to_string() })
+        .accessibility_state(move || AccessibilityState {
+            checked: Some(if checked() { Checked::True } else { Checked::False }),
+            ..AccessibilityState::default()
+        })
+        // A song that is already there cannot be picked again; while busy nothing can change.
+        .disabled(move || is_saved() || locked())
+        .on_press(move || {
+            if is_saved() || locked() {
+                return;
+            }
+            let uri = item.get_untracked().uri;
+            selected.update(|v| {
+                if let Some(i) = v.iter().position(|u| *u == uri) {
+                    v.remove(i);
+                } else {
+                    v.push(uri);
+                }
+            });
+        })
+        .flex_row()
+        .items_center()
+        .gap(px(14.0))
+        .min_h(px(64.0))
+        .px(px(10.0))
+        .rounded(px(14.0))
+        .opacity(move || if locked() && !is_saved() { 0.5_f32 } else { 1.0_f32 })
+        .active(|s| s.bg(rgba(0xffffff12)))
+        .child(
+            view()
+                .size(px(48.0))
+                .flex_shrink_0()
+                .rounded(px(8.0))
+                .overflow_hidden()
+                .child(playlist_tile(item, 48.0, true)),
+        )
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(
+                    text(move || item.get().name)
+                        .text_size(px(19.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .number_of_lines(1)
+                        .text_color(white()),
+                )
+                .child(
+                    text(move || {
+                        if is_saved() {
+                            "Saved".to_string()
+                        } else {
+                            song_count_text(item.get().song_count)
+                        }
+                    })
+                    .test_id("add_sheet_row_note")
+                    .text_size(px(14.0))
+                    .number_of_lines(1)
+                    .text_color(move || if is_saved() { rgba(GREEN) } else { rgba(FAINT) }),
+                ),
+        )
+        .child(
+            view()
+                .size(px(28.0))
+                .flex_shrink_0()
+                .rounded_full()
+                .border_2()
+                .border_color(move || if checked() { rgba(GREEN) } else { rgba(0xffffff66) })
+                .bg(move || if checked() { rgba(GREEN) } else { rgba(0x00000000) })
+                .items_center()
+                .justify_center()
+                .child(when(checked, || icon(|| Icon::Check, 16.0, || ON_GREEN))),
+        )
+}
+
+/// The "Add to playlist" sheet. It works on the snapshot taken when it opened. "Done" asks the
+/// backend to add the song to the newly picked places and the sheet only says it worked when
+/// the backend's state says so.
+fn add_sheet(
+    target: Signal<Option<AddTarget>>,
+    playlists: Signal<Vec<PlaylistSummary>>,
+    hooks: MusicHooks,
+) -> impl IntoElement {
+    let snapshot = target.get_untracked().unwrap_or_default();
+    let track_uri = snapshot.track_uri.clone();
+    let track_title = snapshot.title.clone();
+    let save = hooks.save;
+    let save_to = hooks.save_to.clone();
+
+    let query = signal(String::new());
+    let selected = signal(Vec::<String>::new());
+    let submitted = signal(false);
+    let saw_busy = signal(false);
+    let notice_before = stored(None::<String>);
+
+    // The backend state counts only when it is about this song.
+    let uri_for_status = track_uri.clone();
+    let status = computed(move || {
+        let s = save.get();
+        (s.track_uri == uri_for_status).then_some(s)
+    });
+    let loading = move || status.get().is_none_or(|s| s.loading);
+    let busy = move || status.get().is_some_and(|s| s.busy);
+    let error = move || status.get().and_then(|s| s.error);
+    let notice = move || if submitted.get() { status.get().and_then(|s| s.notice) } else { None };
+    let saved = computed(move || status.get().map(|s| s.saved_in).unwrap_or_default());
+    let locked = move || loading() || busy();
+
+    let visible = computed(move || add_targets(&playlists.get(), &query.get()));
+    let any_targets = computed(move || playlists.get().iter().any(|p| p.can_add_tracks && !p.is_dj()));
+
+    // Success is when the backend finished (not busy), reports no error and has a notice, after
+    // this sheet's own Done. Then the sheet closes by itself after a moment.
+    effect(move || {
+        if !submitted.get() {
+            return;
+        }
+        let Some(s) = status.get() else { return };
+        if s.busy {
+            saw_busy.set(true);
+            return;
+        }
+        let fresh = saw_busy.get_untracked() || s.notice != notice_before.get();
+        if s.error.is_none() && s.notice.is_some() && fresh {
+            let closer = spawn(async move {
+                timer(Duration::from_millis(1400)).await;
+                target.set(None);
+            });
+            cleanup(move || closer.cancel());
+        }
+    });
+
+    let uri_for_done = track_uri.clone();
+    let done = move || {
+        let have = saved.get_untracked();
+        let fresh_picks: Vec<String> =
+            selected.get_untracked().into_iter().filter(|u| !have.contains(u)).collect();
+        if fresh_picks.is_empty() {
+            target.set(None);
+            return;
+        }
+        if busy() {
+            return;
+        }
+        notice_before.replace(status.get_untracked().and_then(|s| s.notice));
+        saw_busy.set(false);
+        submitted.set(true);
+        save_to(&uri_for_done, fresh_picks);
+    };
+
+    let panel_h = move || {
+        let room = window().height.0 - keyboard_height().0 - 48.0;
+        px(room.clamp(300.0, 660.0))
+    };
+
+    view()
+        .test_id("add_sheet")
+        .absolute()
+        .inset_0()
+        .items_center()
+        .pt(px(24.0))
+        .px(px(24.0))
+        .child(
+            view()
+                .test_id("add_sheet_backdrop")
+                .role(AccessibilityRole::Button)
+                .label("Cancel")
+                .absolute()
+                .inset_0()
+                .bg(rgba(0x000000b8))
+                .on_press(move || target.set(None)),
+        )
+        .child(
+            view()
+                .test_id("add_sheet_panel")
+                .role(AccessibilityRole::Group)
+                .label("Add to playlist")
+                .w_full()
+                .max_w(px(560.0))
+                .h(panel_h)
+                .p(px(20.0))
+                .gap(px(12.0))
+                .rounded(px(28.0))
+                .border_1()
+                .border_color(rgba(0xffffff26))
+                .bg(rgba(0x1b1b1eff))
+                .shadow_2xl()
+                .child(
+                    view()
+                        .gap(px(2.0))
+                        .child(
+                            text("Add to playlist")
+                                .test_id("add_sheet_title")
+                                .role(AccessibilityRole::Header)
+                                .text_size(px(26.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(white()),
+                        )
+                        .child(
+                            text(track_title)
+                                .test_id("add_sheet_track")
+                                .text_size(px(16.0))
+                                .number_of_lines(1)
+                                .text_color(rgba(MUTED)),
+                        ),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .h(px(48.0))
+                        .px(px(14.0))
+                        .rounded(px(12.0))
+                        .bg(rgba(0xffffff14))
+                        .child(icon(|| Icon::Search, 20.0, || 0xffffff99))
+                        .child(
+                            nsh_core::element::input()
+                                .test_id("add_sheet_search")
+                                .label("Find a playlist")
+                                .placeholder("Find a playlist")
+                                .value(move || query.get())
+                                .on_change(move |text: &str| query.set(text.to_owned()))
+                                .auto_capitalize(AutoCapitalize::None)
+                                .auto_correct(false)
+                                .keyboard_appearance(KeyboardAppearance::Dark)
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .h(px(44.0))
+                                .text_size(px(18.0))
+                                .text_color(white()),
+                        ),
+                )
+                .child(
+                    scroll()
+                        .test_id("add_sheet_list")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .scrollbar(false)
+                        .child(
+                            view()
+                                .gap(px(2.0))
+                                .child(each(
+                                    move || visible.get(),
+                                    |p: &PlaylistSummary| p.uri.clone(),
+                                    move |item, _| sheet_row(item, saved, selected, locked),
+                                ))
+                                .child(when(move || visible.get().is_empty(), move || {
+                                    text(move || {
+                                        if !any_targets.get() {
+                                            "No playlists you can add to yet."
+                                        } else {
+                                            "No playlist matches that name."
+                                        }
+                                    })
+                                    .test_id("add_sheet_empty")
+                                    .px(px(10.0))
+                                    .py(px(18.0))
+                                    .text_size(px(17.0))
+                                    .text_color(rgba(FAINT))
+                                })),
+                        ),
+                )
+                .child(
+                    // One line for what is going on: checking, saving, a problem, or done.
+                    text(move || {
+                        if let Some(e) = error() {
+                            e
+                        } else if busy() {
+                            "Saving\u{2026}".to_string()
+                        } else if let Some(n) = notice() {
+                            n
+                        } else if loading() {
+                            "Checking where this song is saved\u{2026}".to_string()
+                        } else {
+                            String::new()
+                        }
+                    })
+                    .test_id("add_sheet_status")
+                    .role(AccessibilityRole::Alert)
+                    .text_size(px(15.0))
+                    .line_height(px(20.0))
+                    .number_of_lines(2)
+                    .text_color(move || {
+                        if error().is_some() {
+                            rgba(0xff8d8dff)
+                        } else if notice().is_some() && !busy() {
+                            rgba(GREEN)
+                        } else {
+                            rgba(MUTED)
+                        }
+                    }),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(12.0))
+                        .child(sheet_button("add_sheet_cancel", || "Cancel".to_string(), false, || false, move || {
+                            target.set(None)
+                        }))
+                        .child(sheet_button(
+                            "add_sheet_done",
+                            move || if busy() { "Saving\u{2026}".to_string() } else { "Done".to_string() },
+                            true,
+                            busy,
+                            done,
+                        )),
+                ),
+        )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2226,7 +3079,74 @@ mod tests {
     // Probes render the Music card alone in a given state.
     fn probe(state: SpotifyState) -> impl IntoElement {
         let s = signal(state);
-        view().flex_1().p(px(24.0)).child(music_card(s, spotify::playlists()))
+        view().flex_1().p(px(24.0)).child(music_card(s, spotify::playlists(), test_hooks(s)))
+    }
+
+    // A fake backend for the add sheet and the volume slider: it records what the UI asked for.
+    // The headless app may run on another thread than the test, so this is process-wide, and
+    // the tests that use it take `fake_lock()` so they never overlap.
+    use std::sync::Mutex;
+    static VOLUMES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static INSPECTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static SAVES: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
+    /// Where the fake says the song already is.
+    static ALREADY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    /// When set, a save fails with this message instead of succeeding.
+    static FAIL_WITH: Mutex<Option<String>> = Mutex::new(None);
+    /// A state the test wants the running app to switch to (picked up by `SheetDashboard`).
+    static NEXT_STATE: Mutex<Option<SpotifyState>> = Mutex::new(None);
+    static FAKE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serialises the tests that use the fake backend and clears it.
+    fn fake_lock() -> std::sync::MutexGuard<'static, ()> {
+        let guard = FAKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        VOLUMES.lock().unwrap().clear();
+        INSPECTED.lock().unwrap().clear();
+        SAVES.lock().unwrap().clear();
+        ALREADY.lock().unwrap().clear();
+        *FAIL_WITH.lock().unwrap() = None;
+        *NEXT_STATE.lock().unwrap() = None;
+        guard
+    }
+    fn test_hooks(_state: Signal<SpotifyState>) -> MusicHooks {
+        let save = signal(SaveTrackState::default());
+        MusicHooks {
+            target: signal(None),
+            save,
+            inspect: Rc::new(move |uri: &str| {
+                INSPECTED.lock().unwrap().push(uri.to_string());
+                save.set(SaveTrackState {
+                    track_uri: uri.to_string(),
+                    loading: false,
+                    saved_in: ALREADY.lock().unwrap().clone(),
+                    ..SaveTrackState::default()
+                });
+            }),
+            save_to: Rc::new(move |uri: &str, to: Vec<String>| {
+                SAVES.lock().unwrap().push((uri.to_string(), to.clone()));
+                let mut s = save.get_untracked();
+                s.busy = true;
+                s.error = None;
+                s.notice = None;
+                save.set(s.clone());
+                let uri = uri.to_string();
+                spawn(async move {
+                    timer(Duration::from_millis(150)).await;
+                    let mut done = s;
+                    done.busy = false;
+                    done.track_uri = uri;
+                    match FAIL_WITH.lock().unwrap().clone() {
+                        Some(e) => done.error = Some(e),
+                        None => {
+                            done.saved_in.extend(to);
+                            done.notice = Some("Added to your playlists".to_string());
+                        }
+                    }
+                    save.set(done);
+                });
+            }),
+            set_volume: Rc::new(|v: u8| VOLUMES.lock().unwrap().push(v)),
+        }
     }
 
     #[component]
@@ -2338,30 +3258,108 @@ mod tests {
     fn many_playlists(n: usize) -> Vec<PlaylistSummary> {
         (0..n)
             .map(|i| PlaylistSummary {
-                uri: format!("spotify:playlist:{i}"),
+                uri: if i == 0 { "spotify:user:me:collection".to_string() } else { format!("spotify:playlist:{i}") },
                 name: if i == 0 { "Liked Songs".to_string() } else { format!("Playlist {i}") },
                 image_url: None,
+                can_add_tracks: true,
+                song_count: Some(i as u32 * 3),
             })
             .collect()
+    }
+
+    fn playlist(uri: &str, name: &str, can_add: bool) -> PlaylistSummary {
+        PlaylistSummary {
+            uri: uri.to_string(),
+            name: name.to_string(),
+            image_url: None,
+            can_add_tracks: can_add,
+            song_count: None,
+        }
+    }
+
+    /// Liked Songs, Spotify DJ (not addable), two editable playlists and one followed (read only).
+    fn sheet_playlists() -> Vec<PlaylistSummary> {
+        vec![
+            playlist("spotify:user:me:collection", "Liked Songs", true),
+            playlist("spotify:playlist:37i9dQZF1EYkqdzj48dyYq", "DJ", false),
+            playlist("spotify:playlist:road", "Road Trip", true),
+            playlist("spotify:playlist:focus", "Deep Focus", true),
+            playlist("spotify:playlist:readonly", "Followed Mix", false),
+        ]
+    }
+
+    fn with_track() -> Playback {
+        Playback {
+            track_uri: Some("spotify:track:abc123".into()),
+            volume_percent: Some(40),
+            can_set_volume: true,
+            ..controllable()
+        }
     }
 
     #[component]
     fn ProbeWithPlaylists() -> impl IntoElement {
         let s = signal(SpotifyState::Connected(controllable()));
         let list = signal(many_playlists(20));
-        view().flex_1().p(px(24.0)).child(music_card(s, list))
+        view().flex_1().p(px(24.0)).child(music_card(s, list, test_hooks(s)))
     }
 
     #[component]
     fn FullTimerOpen() -> impl IntoElement {
-        let s = signal(SpotifyState::Connected(controllable()));
-        dashboard_content(s, signal(many_playlists(12)), true)
+        let s = signal(SpotifyState::Connected(with_track()));
+        dashboard_content(s, signal(many_playlists(12)), test_hooks(s), true)
     }
 
     #[component]
     fn FullTimerClosed() -> impl IntoElement {
+        let s = signal(SpotifyState::Connected(with_track()));
+        dashboard_content(s, signal(many_playlists(12)), test_hooks(s), false)
+    }
+
+    #[component]
+    fn SheetDashboard() -> impl IntoElement {
+        let s = signal(SpotifyState::Connected(with_track()));
+        let hooks = test_hooks(s);
+        // The test hands over a new Spotify state through `NEXT_STATE`; the app picks it up here.
+        set_interval(Duration::from_millis(30), move || {
+            if let Some(next) = NEXT_STATE.lock().unwrap().take() {
+                s.set(next);
+            }
+        });
+        dashboard_content(s, signal(sheet_playlists()), hooks, false)
+    }
+
+    #[component]
+    fn SheetDashboardTimerOpen() -> impl IntoElement {
+        let s = signal(SpotifyState::Connected(with_track()));
+        dashboard_content(s, signal(sheet_playlists()), test_hooks(s), true)
+    }
+
+    #[component]
+    fn ProbeNoVolume() -> impl IntoElement {
+        probe(SpotifyState::Connected(Playback { track_uri: Some("spotify:track:abc123".into()), ..controllable() }))
+    }
+
+    #[component]
+    fn ProbeVolume() -> impl IntoElement {
+        probe(SpotifyState::Connected(with_track()))
+    }
+
+    #[component]
+    fn ProbeEpisode() -> impl IntoElement {
+        probe(SpotifyState::Connected(Playback { track_uri: Some("spotify:episode:xyz".into()), ..controllable() }))
+    }
+
+    #[component]
+    fn ProbeNamedTiles() -> impl IntoElement {
         let s = signal(SpotifyState::Connected(controllable()));
-        dashboard_content(s, signal(many_playlists(12)), false)
+        let list = signal(vec![
+            playlist("spotify:user:me:collection", "Liked Songs", true),
+            playlist("spotify:playlist:37i9dQZF1EYkqdzj48dyYq", "DJ", false),
+            playlist("spotify:playlist:a", "Road Trip", true),
+            playlist("spotify:playlist:b", "Chill Lofi Study Beats Forever", true),
+        ]);
+        view().flex_1().p(px(24.0)).child(music_card(s, list, test_hooks(s)))
     }
 
     #[test]
@@ -3076,5 +4074,270 @@ mod tests {
         app.wait_for("id:clock_time").unwrap();
         app.wait_for("id:music_status").unwrap();
         app.wait_for("id:timer_open").unwrap();
+    }
+
+    // ----- Playlist tiles, volume, add to playlist -----
+
+    #[test]
+    fn short_names_stay_text_and_long_ones_become_initials() {
+        assert_eq!(short_label("Road Trip"), ("Road Trip".to_string(), false));
+        assert_eq!(short_label("Gym"), ("Gym".to_string(), false));
+        assert_eq!(short_label("Chill Lofi Study Beats Forever"), ("CLS".to_string(), true));
+        assert_eq!(short_label("Supercalifragilistic"), ("SUP".to_string(), true));
+        assert_eq!(short_label("   "), ("?".to_string(), true));
+        assert_eq!(initials("my daily mix 1"), "MDM");
+    }
+
+    #[test]
+    fn the_sheet_lists_only_places_a_song_can_go() {
+        let all = sheet_playlists();
+        let names = |q: &str| add_targets(&all, q).into_iter().map(|p| p.name).collect::<Vec<_>>();
+        assert_eq!(names(""), ["Liked Songs", "Road Trip", "Deep Focus"]);
+        assert_eq!(names("  road "), ["Road Trip"]);
+        assert!(names("dj").is_empty(), "DJ must never be a target");
+        assert!(names("followed").is_empty(), "read-only playlists are not targets");
+        // DJ is excluded even if a backend wrongly says it is addable.
+        let mut dj = playlist("spotify:playlist:37i9dQZF1EYkqdzj48dyYq", "DJ", true);
+        dj.can_add_tracks = true;
+        assert!(add_targets(&[dj], "").is_empty());
+        assert!(is_track_uri("spotify:track:abc") && !is_track_uri("spotify:episode:abc") && !is_track_uri("spotify:track:"));
+        assert_eq!(volume_at(50.0, 200.0), 25);
+        assert_eq!(volume_at(-5.0, 200.0), 0);
+        assert_eq!(volume_at(999.0, 200.0), 100);
+    }
+
+    #[test]
+    fn playlists_without_a_cover_show_a_name_liked_a_heart_and_dj_its_tile() {
+        let mut app = Headless::start(landscape_config(Root::of::<ProbeNamedTiles>())).unwrap();
+        app.wait_for("id:spotify_playlists").unwrap();
+        assert_eq!(app.screen().count("id:playlist_tile_liked").unwrap(), 1);
+        assert_eq!(app.screen().count("id:playlist_tile_dj").unwrap(), 1);
+        assert_eq!(app.screen().count("id:playlist_tile_name").unwrap(), 2);
+        // Short names are readable; the long one is shortened to initials.
+        app.wait_for("text:Road Trip").unwrap();
+        app.wait_for("text:CLS").unwrap();
+        assert_eq!(app.screen().count("text:Chill Lofi Study Beats Forever").unwrap(), 0);
+        // Everyone still has the full name for VoiceOver.
+        app.wait_for("label:Chill Lofi Study Beats Forever").unwrap();
+        app.wait_for("label:Liked Songs").unwrap();
+        app.wait_for("label:DJ").unwrap();
+    }
+
+    #[test]
+    fn the_volume_slider_sends_once_on_release_and_only_when_supported() {
+        let _fake = fake_lock();
+        let mut app = Headless::start(landscape_config(Root::of::<ProbeVolume>())).unwrap();
+        app.wait_for("id:spotify_volume").unwrap();
+        app.wait_for("label:Volume on Windows PC").unwrap();
+        app.wait_for("text:40%").unwrap();
+        // A drag of many moves sends one value, at the end.
+        app.drag("id:spotify_volume", nsh_core::geometry::point(px(60.0), px(0.0))).unwrap();
+        let sent = VOLUMES.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "one command per gesture, got {sent:?}");
+        assert!(sent[0] > 50 && sent[0] <= 100, "dragged right from the middle: {sent:?}");
+        // The slider shows what was asked for straight away.
+        app.wait_for(&format!("text:{}%", sent[0])).unwrap();
+
+        // No volume support: no slider at all.
+        let app = Headless::start(landscape_config(Root::of::<ProbeNoVolume>())).unwrap();
+        assert_eq!(app.screen().count("id:spotify_volume").unwrap(), 0);
+        assert_eq!(app.screen().count("id:spotify_volume_row").unwrap(), 0);
+    }
+
+    #[test]
+    fn the_plus_is_off_without_a_spotify_track() {
+        let mut app = Headless::start(landscape_config(Root::of::<ProbeConnectedControllable>())).unwrap();
+        app.wait_for("id:spotify_add").unwrap();
+        assert!(!app.screen().enabled("id:spotify_add").unwrap(), "no track uri");
+        let mut app = Headless::start(landscape_config(Root::of::<ProbeEpisode>())).unwrap();
+        app.wait_for("id:spotify_add").unwrap();
+        assert!(!app.screen().enabled("id:spotify_add").unwrap(), "podcast episodes cannot be saved here");
+        let mut app = Headless::start(landscape_config(Root::of::<ProbeVolume>())).unwrap();
+        app.wait_for("id:spotify_add").unwrap();
+        assert!(app.screen().enabled("id:spotify_add").unwrap());
+    }
+
+    fn open_sheet(app: &mut Headless) {
+        app.wait_for("id:spotify_add").unwrap();
+        app.press("id:spotify_add").unwrap();
+        app.wait_for("id:add_sheet_panel").unwrap();
+        app.wait_for("id:add_sheet_row").unwrap();
+    }
+
+    #[test]
+    fn the_add_sheet_hides_dj_marks_saved_and_saves_only_new_picks() {
+        let _fake = fake_lock();
+        ALREADY.lock().unwrap().push("spotify:user:me:collection".to_string());
+        let mut app = Headless::start(landscape_config(Root::of::<SheetDashboard>())).unwrap();
+        open_sheet(&mut app);
+        // Opening asks the backend about this exact song.
+        assert_eq!(INSPECTED.lock().unwrap().clone(), ["spotify:track:abc123"]);
+        app.wait_for("text:Add to playlist").unwrap();
+        // The song name is in the sheet; DJ and read-only playlists are not.
+        assert_eq!(app.screen().count("id:add_sheet_row").unwrap(), 3);
+        assert_eq!(app.screen().count("id:add_sheet_panel >> label:DJ").unwrap(), 0);
+        assert_eq!(app.screen().count("id:add_sheet_panel >> label:Followed Mix").unwrap(), 0);
+        // Liked Songs already has it: "Saved", cannot be picked again.
+        app.wait_for("text:Saved").unwrap();
+        let liked = app.screen().accessibility_state("id:add_sheet_panel >> label:Liked Songs").unwrap();
+        assert_eq!(liked.checked, Some(Checked::True));
+        assert!(!app.screen().enabled("id:add_sheet_panel >> label:Liked Songs").unwrap(), "saved row must not be pickable");
+        assert!(app.screen().enabled("id:add_sheet_panel >> label:Road Trip").unwrap());
+
+        // Search narrows the list.
+        app.type_text("id:add_sheet_search", "road").unwrap();
+        assert_eq!(app.screen().count("id:add_sheet_row").unwrap(), 1);
+        app.wait_for("id:add_sheet_panel >> label:Road Trip").unwrap();
+        app.type_text("id:add_sheet_search", "zzz").unwrap();
+        // "roadzzz" matches nothing.
+        app.wait_for("id:add_sheet_empty").unwrap();
+        assert_eq!(app.screen().count("id:add_sheet_row").unwrap(), 0);
+    }
+
+    #[test]
+    fn done_saves_to_the_picked_places_and_waits_for_the_backend_before_saying_so() {
+        let _fake = fake_lock();
+        let mut app = Headless::start(landscape_config(Root::of::<SheetDashboard>())).unwrap();
+        open_sheet(&mut app);
+        app.press("id:add_sheet_panel >> label:Road Trip").unwrap();
+        app.press("id:add_sheet_panel >> label:Deep Focus").unwrap();
+        app.press("id:add_sheet_panel >> label:Deep Focus").unwrap();
+        assert_eq!(app.screen().accessibility_state("id:add_sheet_panel >> label:Road Trip").unwrap().checked, Some(Checked::True));
+        assert_eq!(app.screen().accessibility_state("id:add_sheet_panel >> label:Deep Focus").unwrap().checked, Some(Checked::False));
+        // Nothing is claimed before Done.
+        assert_eq!(app.screen().count("text:Added to your playlists").unwrap(), 0);
+        app.press("id:add_sheet_done").unwrap();
+        // The backend got this exact song and only the picked place.
+        assert_eq!(
+            SAVES.lock().unwrap().clone(),
+            [("spotify:track:abc123".to_string(), vec!["spotify:playlist:road".to_string()])]
+        );
+        // While it works: busy, Done off. Success text comes from the backend's notice.
+        app.wait_for("text:Saving\u{2026}").unwrap();
+        assert!(!app.screen().enabled("id:add_sheet_done").unwrap_or(true));
+        app.wait_for("text:Added to your playlists").unwrap();
+        // The sheet closes itself after a moment.
+        app.wait_for_gone("id:add_sheet", Duration::from_secs(6)).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_shows_the_error_and_keeps_the_sheet_open() {
+        let _fake = fake_lock();
+        *FAIL_WITH.lock().unwrap() = Some("Spotify said no.".to_string());
+        let mut app = Headless::start(landscape_config(Root::of::<SheetDashboard>())).unwrap();
+        open_sheet(&mut app);
+        app.press("id:add_sheet_panel >> label:Road Trip").unwrap();
+        app.press("id:add_sheet_done").unwrap();
+        app.wait_for("text:Spotify said no.").unwrap();
+        // Still open after the time a success would have closed it; no success text.
+        let _ = app.wait_for_gone("id:never_there", Duration::from_millis(1800));
+        assert_eq!(app.screen().count("id:add_sheet").unwrap(), 1);
+        assert_eq!(app.screen().count("text:Added to your playlists").unwrap(), 0);
+        // Done works again so the user can retry.
+        assert!(app.screen().enabled("id:add_sheet_done").unwrap());
+    }
+
+    #[test]
+    fn cancel_closes_without_saving_and_done_with_no_picks_just_closes() {
+        let _fake = fake_lock();
+        let mut app = Headless::start(landscape_config(Root::of::<SheetDashboard>())).unwrap();
+        open_sheet(&mut app);
+        app.press("id:add_sheet_panel >> label:Road Trip").unwrap();
+        app.press("id:add_sheet_cancel").unwrap();
+        app.wait_for_gone("id:add_sheet", Duration::from_secs(5)).unwrap();
+        assert!(SAVES.lock().unwrap().is_empty(), "cancel must not save");
+        open_sheet(&mut app);
+        app.press("id:add_sheet_done").unwrap();
+        app.wait_for_gone("id:add_sheet", Duration::from_secs(5)).unwrap();
+        assert!(SAVES.lock().unwrap().is_empty(), "nothing picked, nothing saved");
+        // The dim area around the sheet is a Cancel button too (a headless press goes to the
+        // middle, which the sheet covers, so only its existence is checked).
+        open_sheet(&mut app);
+        app.wait_for("id:add_sheet_backdrop").unwrap();
+        assert!(SAVES.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_sheet_keeps_the_song_it_was_opened_for_when_the_track_changes() {
+        let _fake = fake_lock();
+        let mut app = Headless::start(landscape_config(Root::of::<SheetDashboard>())).unwrap();
+        open_sheet(&mut app);
+        // The next song starts while the sheet is open.
+        *NEXT_STATE.lock().unwrap() = Some(SpotifyState::Connected(Playback {
+            title: Some("Another Song".into()),
+            track_uri: Some("spotify:track:other999".into()),
+            ..with_track()
+        }));
+        app.wait_for("text:Another Song").unwrap();
+        app.wait_for("id:add_sheet").unwrap();
+        app.press("id:add_sheet_panel >> label:Road Trip").unwrap();
+        app.press("id:add_sheet_done").unwrap();
+        let saved = SAVES.lock().unwrap().clone();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].0, "spotify:track:abc123", "must save the song the sheet opened for");
+        // Its title in the sheet is the old one too.
+        app.wait_for("id:add_sheet_track").unwrap();
+        app.wait_for("text:Test Song").unwrap();
+    }
+
+    #[test]
+    fn the_sheet_closes_if_spotify_goes_away() {
+        let _fake = fake_lock();
+        let mut app = Headless::start(landscape_config(Root::of::<SheetDashboard>())).unwrap();
+        open_sheet(&mut app);
+        *NEXT_STATE.lock().unwrap() = Some(SpotifyState::SignedOut);
+        app.wait_for_gone("id:add_sheet", Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn the_sheet_and_the_new_controls_fit_with_the_timer_open() {
+        let _fake = fake_lock();
+        for (w, h) in [(1024.0_f32, 768.0_f32), (768.0, 1024.0)] {
+            let mut config = EngineConfig::new(Root::of::<SheetDashboardTimerOpen>());
+            config.viewport = Size::new(Points(w), Points(h));
+            config.environment.window = config.viewport;
+            let mut app = Headless::start(config).unwrap();
+            app.wait_for("id:timer_panel").unwrap();
+            app.wait_for("id:spotify_volume").unwrap();
+            app.wait_for("id:spotify_add").unwrap();
+            let landscape = w > h;
+            let window = (0.0, 0.0, w, h);
+            let ids = ["spotify_add", "spotify_volume", "spotify_volume_row", "spotify_title", "spotify_transport", "spotify_seek", "music_status", "timer_panel"];
+            let found = rects(&app, &ids);
+            let get = |id: &str| found.iter().find(|(i, _)| i == id).unwrap().1;
+            eprintln!("{w}x{h} timer open:");
+            for (id, r) in &found {
+                eprintln!("  {id:>20}: x {:7.1} y {:7.1} w {:7.1} h {:7.1}", r.0, r.1, r.2, r.3);
+            }
+            if landscape {
+                for (id, r) in &found {
+                    assert!(inside(*r, window), "{id} {r:?} leaves the window");
+                }
+            }
+            let card = get("music_status");
+            for id in ["spotify_add", "spotify_volume", "spotify_volume_row", "spotify_transport", "spotify_seek"] {
+                assert!(inside(get(id), card), "{id} {:?} leaves the music card {card:?}", get(id));
+                assert!(!overlaps(get(id), get("timer_panel")), "{id} overlaps the timer panel");
+            }
+            // The plus sits beside the title, not over it, and the slider clears the buttons.
+            assert!(!overlaps(get("spotify_add"), get("spotify_title")), "plus overlaps the title");
+            assert!(!overlaps(get("spotify_volume_row"), get("spotify_transport")), "volume overlaps transport");
+            assert!(!overlaps(get("spotify_volume_row"), get("spotify_seek")), "volume overlaps seek");
+            // The plus is a comfortable touch target.
+            assert!(get("spotify_add").2 >= 44.0 && get("spotify_add").3 >= 44.0);
+
+            // The open sheet stays on the screen too (also with the timer panel behind it).
+            app.press("id:spotify_add").unwrap();
+            app.wait_for("id:add_sheet_panel").unwrap();
+            let sheet = rects(&app, &["add_sheet_panel", "add_sheet_done", "add_sheet_cancel", "add_sheet_search"]);
+            for (id, r) in &sheet {
+                eprintln!("  {id:>20}: x {:7.1} y {:7.1} w {:7.1} h {:7.1}", r.0, r.1, r.2, r.3);
+                assert!(inside(*r, window), "{id} {r:?} leaves the {w}x{h} window");
+            }
+            let panel = sheet[0].1;
+            for (id, r) in &sheet[1..] {
+                assert!(inside(*r, panel), "{id} {r:?} leaves the sheet {panel:?}");
+            }
+        }
     }
 }

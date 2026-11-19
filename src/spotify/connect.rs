@@ -124,6 +124,15 @@ pub fn track_uri(cluster: &Cluster) -> Option<String> {
         .filter(|u| !u.is_empty())
 }
 
+/// Connect volume uses the full u16 range, not percentage.
+pub fn volume_percent(raw: u32) -> u8 {
+    ((raw.min(65_535) as u64 * 100 + 32_767) / 65_535) as u8
+}
+
+pub fn volume_raw(percent: u8) -> i32 {
+    ((u32::from(percent.min(100)) * 65_535 + 50) / 100) as i32
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -183,6 +192,13 @@ pub fn playback_from_cluster(
     if duration_ms > 0 {
         progress_ms = progress_ms.min(duration_ms);
     }
+    // Paused playback can have no active id; expose volume only if there is one unambiguous
+    // remote player. The session fills in its last-active device when there are several.
+    let remote = cluster.device.get(active).or_else(|| {
+        let mut candidates = cluster.device.iter().filter(|(id, d)| id.as_str() != own_device_id && d.can_play);
+        let (_, only) = candidates.next()?;
+        candidates.next().is_none().then_some(only)
+    });
     Playback {
         device,
         title: info.title,
@@ -206,6 +222,11 @@ pub fn playback_from_cluster(
             _ => RepeatMode::Off,
         },
         context_uri: Some(state.context_uri.clone()).filter(|u| !u.is_empty()),
+        track_uri: track_uri(cluster),
+        volume_percent: remote.map(|d| volume_percent(d.volume)),
+        can_set_volume: remote.is_some_and(|d| {
+            !d.capabilities.as_ref().is_some_and(|c| c.disable_volume)
+        }),
     }
 }
 
@@ -388,6 +409,29 @@ mod tests {
         assert_eq!(info.device_id, "dev1");
         assert_eq!(r.put_state_reason.enum_value(), Ok(PutStateReason::NEW_DEVICE));
         assert!(!r.write_to_bytes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remote_volume_scale_and_capability() {
+        assert_eq!(volume_percent(0), 0);
+        assert_eq!(volume_percent(65_535), 100);
+        assert_eq!(volume_raw(100), 65_535);
+        assert_eq!(volume_raw(255), 65_535);
+        assert_eq!(volume_percent(volume_raw(50) as u32), 50);
+        let mut c = cluster("pc", false);
+        let device = c.device.get_mut("pc").unwrap();
+        device.can_play = true;
+        device.volume = 32_768;
+        let p = playback_from_cluster(&c, "me", None, 0);
+        assert_eq!(p.volume_percent, Some(50));
+        assert!(p.can_set_volume);
+        assert_eq!(p.track_uri.as_deref(), Some("spotify:track:4uLU6hMCjMI75M1A2tKUQC"));
+        c.active_device_id.clear();
+        assert!(playback_from_cluster(&c, "me", None, 0).can_set_volume);
+        c.device.get_mut("pc").unwrap().capabilities = MessageField::some(Capabilities {
+            disable_volume: true, ..Default::default()
+        });
+        assert!(!playback_from_cluster(&c, "me", None, 0).can_set_volume);
     }
 
     #[test]

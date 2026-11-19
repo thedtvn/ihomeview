@@ -5,7 +5,9 @@ Goal: show and control Spotify playing on **another** Spotify Connect device (e.
 ## Files
 
 - `connect.rs`: observer device registration, cluster to `Playback` mapping, command bodies. Pure and unit-tested.
-- `session.rs`: the live librespot `Session`: access point login, dealer, observer loop.
+- `session.rs`: the live librespot `Session`: access point login, dealer, observer loop, remote volume.
+- `library.rs`: playlist metadata, explicit edit permissions and URI validation.
+- `library_io.rs`: membership reads and add-only saves to Liked Songs or editable playlists. Writes are single-attempt, then read back; uncertain results are reported rather than blindly retried.
 - `mod.rs`: the UI contract (`SpotifyState`, `Playback`, `SpotifyCommand`, `start`, `send`) and persistence.
 
 ## librespot fork
@@ -27,9 +29,13 @@ librespot needs the tokio runtime context; NSH press handlers do not have it, an
 
 Hold the clock to open the debug log: every login step, errors (with librespot's error kind) and commands are listed there, newest first, with Copy.
 
-## Not yet verified
+## Verification and limits
 
-That a hidden non-player device receives cluster updates; that the player-command endpoint accepts commands from it. Failures show an error on the music card and in the debug log; it never shows made-up playback.
+Hidden-observer playback and play/pause/seek/shuffle/repeat/playlist quick play have been exercised on the iPad against the Windows player. The volume endpoint was checked on PC with a no-change PUT, and library membership and edit permissions with read-only requests. New library writes and their UI still require device testing.
+
+Remote volume uses `PUT /connect-state/v1/connect/volume/from/{observer}/to/{player}` with a `SetVolumeCommand` protobuf (0–65535). It never changes the iPad's speaker volume.
+
+Library additions use `/collection/v2/write` (Liked Songs) and `/playlist/v2/playlist/{id}/changes` (fresh-revision ADD protobuf). Destinations require explicit server `can_edit_items` permission; DJ (`37i9dQZF1EYkqdzj48dyYq`) is always excluded. Existing membership is read before writing to avoid duplicates. A request failure is not automatically retried because the server may already have accepted the addition. Only a read-after-write confirmation reports success; partial and uncertain results remain visible.
 
 ## Build notes
 
