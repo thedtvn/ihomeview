@@ -12,6 +12,7 @@
       "MinimumOSVersion": "15.0",
       "UIRequiredDeviceCapabilities": ["arm64"],
       "UIDeviceFamily": [2],
+      "UIRequiresFullScreen": true,
       "LSApplicationQueriesSchemes": ["spotify"]
     }
   }

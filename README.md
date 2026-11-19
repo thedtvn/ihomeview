@@ -6,7 +6,7 @@ A native desk dashboard for an old iPad, written in Rust with [Native Shell](htt
 - Keep screen on (Settings): only while charging (default), always, or off. On battery the iPad auto-locks normally.
 - A focus timer that stays hidden until you open it; drag the hours, minutes or seconds up/down to set it.
 - A music card for Spotify (experimental, see below): artwork, seekable time bar, play/pause/skip, shuffle / Smart Shuffle, repeat, and your playlists for quick play.
-- Full screen: the iOS status bar is hidden.
+- Full screen: the iOS status bar is hidden, and iPad Split View / Slide Over are disabled.
 - Hold the clock to open a debug log (Spotify connection steps and errors, with Copy).
 
 ## Requirements

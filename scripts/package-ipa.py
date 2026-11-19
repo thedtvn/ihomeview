@@ -21,6 +21,8 @@ def package(source: Path, destination: Path):
         raise ValueError(f'Unsupported minimum OS: {minimum}')
     if 2 not in info.get('UIDeviceFamily', []):
         raise ValueError('App does not declare iPad support')
+    if info.get('UIRequiresFullScreen') is not True:
+        raise ValueError('App must require full screen (no iPad Split View or Slide Over)')
     executable = app / info['CFBundleExecutable']
     archs = subprocess.check_output(['xcrun', 'lipo', '-archs', str(executable)], text=True).strip()
     if 'arm64' not in archs.split():
@@ -42,7 +44,7 @@ def package(source: Path, destination: Path):
             raise ValueError('IPA archive integrity failed')
     digest = hashlib.sha256(destination.read_bytes()).hexdigest()
     destination.with_suffix('.ipa.sha256').write_text(digest + '  ' + destination.name + '\n')
-    evidence = {k: info.get(k) for k in ('CFBundleIdentifier', 'CFBundleShortVersionString', 'CFBundleVersion', 'MinimumOSVersion', 'UIDeviceFamily')}
+    evidence = {k: info.get(k) for k in ('CFBundleIdentifier', 'CFBundleShortVersionString', 'CFBundleVersion', 'MinimumOSVersion', 'UIDeviceFamily', 'UIRequiresFullScreen')}
     evidence.update(architectures=archs, macho_minimums=device_minos, sha256=digest,
                     signed_for_app_store=False, installation='TrollStore only; installation/launch not verified by packaging')
     destination.with_suffix('.build.json').write_text(json.dumps(evidence, indent=2) + '\n')

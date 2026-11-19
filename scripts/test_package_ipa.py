@@ -20,7 +20,7 @@ class PackagingTests(unittest.TestCase):
         self.app.mkdir(parents=True)
         self.info = {'CFBundleIdentifier': 'io.github.thedtvn.ihomeview',
                      'CFBundleExecutable': 'ihomeview', 'MinimumOSVersion': '15.0',
-                     'UIDeviceFamily': [2], 'CFBundleVersion': '1'}
+                     'UIDeviceFamily': [2], 'CFBundleVersion': '1', 'UIRequiresFullScreen': True}
         self.write_info()
         (self.app / 'ihomeview').write_bytes(b'fixture, not an executable')
         self.out = self.root / 'artifacts' / 'ihomeview.ipa'
@@ -34,7 +34,20 @@ class PackagingTests(unittest.TestCase):
         module.package(self.app.parent, self.out)
         with zipfile.ZipFile(self.out) as archive:
             self.assertIn('Payload/ihomeview.app/Info.plist', archive.namelist())
+            info = plistlib.loads(archive.read('Payload/ihomeview.app/Info.plist'))
+            self.assertIs(info['UIRequiresFullScreen'], True)
+        self.assertIs(json.loads(self.out.with_suffix('.build.json').read_text())['UIRequiresFullScreen'], True)
         self.assertEqual(json.loads(self.out.with_suffix('.build.json').read_text())['architectures'], 'arm64')
+
+    def test_rejects_multitasking(self):
+        for value in (False, None, 'true'):
+            with self.subTest(value=value):
+                self.info.pop('UIRequiresFullScreen', None)
+                if value is not None:
+                    self.info['UIRequiresFullScreen'] = value
+                self.write_info()
+                with self.assertRaisesRegex(ValueError, 'must require full screen'):
+                    module.package(self.app.parent, self.out)
 
     def test_rejects_newer_ipados(self):
         self.info['MinimumOSVersion'] = '16.0'
