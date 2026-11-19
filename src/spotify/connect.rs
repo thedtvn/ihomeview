@@ -22,7 +22,7 @@ use librespot::protocol::{
 };
 use protobuf::{EnumOrUnknown, MessageField};
 
-use super::Playback;
+use super::{Playback, RepeatMode};
 
 pub const OBSERVER_NAME: &str = "ihomeview";
 
@@ -139,15 +139,25 @@ pub fn playback_from_cluster(
     now_ms: i64,
 ) -> Playback {
     let active = cluster.active_device_id.as_str();
-    if active.is_empty() || active == own_device_id {
+    if active == own_device_id && !active.is_empty() {
         return Playback::default();
     }
-    let device = cluster
-        .device
-        .get(active)
-        .map(|d| d.name.clone())
-        .filter(|n| !n.is_empty())
-        .or_else(|| Some("Spotify device".into()));
+    // After a pause, Spotify often drops the active device but keeps the last player state:
+    // keep showing that track (paused) instead of "Nothing playing".
+    let idle = active.is_empty();
+    if idle && track_uri(cluster).is_none() {
+        return Playback::default();
+    }
+    let device = if idle {
+        None
+    } else {
+        cluster
+            .device
+            .get(active)
+            .map(|d| d.name.clone())
+            .filter(|n| !n.is_empty())
+            .or_else(|| Some("Spotify device".into()))
+    };
     let Some(state) = cluster.player_state.as_ref() else {
         return Playback { device, ..Default::default() };
     };
@@ -162,7 +172,7 @@ pub fn playback_from_cluster(
         info.album = info.album.or_else(|| extra.album.clone());
         info.artwork_url = info.artwork_url.or_else(|| extra.artwork_url.clone());
     }
-    let is_playing = state.is_playing && !state.is_paused;
+    let is_playing = !idle && state.is_playing && !state.is_paused;
     let duration_ms = state.duration.max(0) as u64;
     let mut progress = state.position_as_of_timestamp.max(0);
     if is_playing && state.timestamp > 0 {
@@ -182,32 +192,93 @@ pub fn playback_from_cluster(
         is_playing,
         progress_ms,
         duration_ms,
+        // Idle (paused, no active device): still controllable; commands go to the last device.
         can_control: track_uri(cluster).is_some(),
+        shuffle: state.options.as_ref().is_some_and(|o| o.shuffling_context),
+        smart_shuffle: state
+            .options
+            .as_ref()
+            .and_then(|o| o.modes.get("context_enhancement"))
+            .is_some_and(|m| m == "RECOMMENDATION"),
+        repeat: match state.options.as_ref() {
+            Some(o) if o.repeating_track => RepeatMode::Track,
+            Some(o) if o.repeating_context => RepeatMode::Context,
+            _ => RepeatMode::Off,
+        },
+        context_uri: Some(state.context_uri.clone()).filter(|u| !u.is_empty()),
     }
 }
 
-/// Commands this app sends to the active device.
+/// Shuffle states of Spotify's shuffle button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShuffleMode {
+    Off,
+    On,
+    /// Smart Shuffle: shuffle plus recommended tracks.
+    Smart,
+}
+
+/// Commands this app sends to the active device.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemoteCommand {
     Pause,
     Resume,
     SkipNext,
     SkipPrev,
+    SetShuffle(ShuffleMode),
+    SetRepeat(RepeatMode),
+    /// Position in milliseconds.
+    SeekTo(u64),
+    /// Play a playlist / album / Liked Songs context from its start.
+    PlayContext(String),
 }
 
 impl RemoteCommand {
     /// The endpoint name; matches the serde tags in librespot-core `dealer/protocol/request.rs`.
-    pub fn endpoint(self) -> &'static str {
+    pub fn endpoint(&self) -> &'static str {
         match self {
             RemoteCommand::Pause => "pause",
             RemoteCommand::Resume => "resume",
             RemoteCommand::SkipNext => "skip_next",
             RemoteCommand::SkipPrev => "skip_prev",
+            RemoteCommand::SetShuffle(_) => "set_options",
+            RemoteCommand::SetRepeat(_) => "set_options",
+            RemoteCommand::SeekTo(_) => "seek_to",
+            RemoteCommand::PlayContext(_) => "play",
         }
     }
 
-    pub fn body(self) -> String {
-        serde_json::json!({ "command": { "endpoint": self.endpoint() } }).to_string()
+    /// The JSON body of `POST /connect-state/v1/player/command/...`. Field names follow the
+    /// commands librespot's connect receives (`dealer/protocol/request.rs`).
+    pub fn body(&self) -> String {
+        let logging = serde_json::json!({});
+        let command = match self {
+            // Exactly what Spotify's web player sends (captured 2026-11-19).
+            RemoteCommand::SetShuffle(mode) => serde_json::json!({
+                "endpoint": self.endpoint(),
+                "shuffling_context": *mode != ShuffleMode::Off,
+                "modes": { "context_enhancement": if *mode == ShuffleMode::Smart { "RECOMMENDATION" } else { "NONE" } },
+                "logging_params": logging,
+            }),
+            RemoteCommand::SetRepeat(mode) => serde_json::json!({
+                "endpoint": self.endpoint(),
+                "repeating_context": *mode != RepeatMode::Off,
+                "repeating_track": *mode == RepeatMode::Track,
+                "logging_params": logging,
+            }),
+            RemoteCommand::SeekTo(ms) => serde_json::json!({
+                "endpoint": self.endpoint(), "value": ms, "position": 0, "logging_params": logging,
+            }),
+            RemoteCommand::PlayContext(uri) => serde_json::json!({
+                "endpoint": self.endpoint(),
+                "context": { "uri": uri, "url": format!("context://{uri}"), "metadata": {} },
+                "play_origin": { "feature_identifier": "ihomeview", "feature_version": env!("CARGO_PKG_VERSION") },
+                "options": { "license": "premium", "skip_to": {}, "player_options_override": {} },
+                "logging_params": logging,
+            }),
+            _ => serde_json::json!({ "endpoint": self.endpoint() }),
+        };
+        serde_json::json!({ "command": command }).to_string()
     }
 }
 
@@ -272,9 +343,22 @@ mod tests {
     }
 
     #[test]
-    fn no_active_device_or_self_is_nothing_playing() {
-        assert_eq!(playback_from_cluster(&cluster("", true), "me", None, 0), Playback::default());
+    fn self_active_is_nothing_playing() {
         assert_eq!(playback_from_cluster(&cluster("me", true), "me", None, 0), Playback::default());
+    }
+
+    /// Seen live: after pausing on the PC, `active_device_id` is empty but the last player state
+    /// (paused track, context, shuffle) is still in the cluster.
+    #[test]
+    fn no_active_device_keeps_last_track_paused() {
+        let p = playback_from_cluster(&cluster("", true), "me", None, 1_005_000);
+        assert_eq!(p.title.as_deref(), Some("Song"));
+        assert!(p.device.is_none());
+        assert!(!p.is_playing && p.can_control);
+        assert_eq!(p.progress_ms, 10_000);
+        let mut empty = cluster("", true);
+        empty.player_state.as_mut().unwrap().track = MessageField::none();
+        assert_eq!(playback_from_cluster(&empty, "me", None, 0), Playback::default());
     }
 
     #[test]
@@ -304,6 +388,49 @@ mod tests {
         assert_eq!(info.device_id, "dev1");
         assert_eq!(r.put_state_reason.enum_value(), Ok(PutStateReason::NEW_DEVICE));
         assert!(!r.write_to_bytes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn new_command_bodies() {
+        let v = |c: RemoteCommand| serde_json::from_str::<serde_json::Value>(&c.body()).unwrap()["command"].clone();
+        let shuffle = v(RemoteCommand::SetShuffle(ShuffleMode::On));
+        assert_eq!(shuffle["endpoint"], "set_options");
+        assert_eq!(shuffle["shuffling_context"], true);
+        assert_eq!(shuffle["modes"]["context_enhancement"], "NONE");
+        let smart = v(RemoteCommand::SetShuffle(ShuffleMode::Smart));
+        assert_eq!(smart["shuffling_context"], true);
+        assert_eq!(smart["modes"]["context_enhancement"], "RECOMMENDATION");
+        let off = v(RemoteCommand::SetShuffle(ShuffleMode::Off));
+        assert_eq!(off["shuffling_context"], false);
+        let repeat = v(RemoteCommand::SetRepeat(RepeatMode::Track));
+        assert_eq!(repeat["endpoint"], "set_options");
+        assert_eq!(repeat["repeating_context"], true);
+        assert_eq!(repeat["repeating_track"], true);
+        let off = v(RemoteCommand::SetRepeat(RepeatMode::Off));
+        assert_eq!(off["repeating_context"], false);
+        let seek = v(RemoteCommand::SeekTo(61_500));
+        assert_eq!(seek["endpoint"], "seek_to");
+        assert_eq!(seek["value"], 61_500);
+        let play = v(RemoteCommand::PlayContext("spotify:playlist:abc".into()));
+        assert_eq!(play["endpoint"], "play");
+        assert_eq!(play["context"]["uri"], "spotify:playlist:abc");
+    }
+
+    #[test]
+    fn maps_shuffle_repeat_and_context() {
+        let mut c = cluster("pc", true);
+        let state = c.player_state.as_mut().unwrap();
+        state.context_uri = "spotify:playlist:xyz".into();
+        let mut opts = librespot::protocol::player::ContextPlayerOptions::new();
+        opts.shuffling_context = true;
+        opts.repeating_context = true;
+        opts.repeating_track = true;
+        opts.modes.insert("context_enhancement".into(), "RECOMMENDATION".into());
+        state.options = MessageField::some(opts);
+        let p = playback_from_cluster(&c, "me", None, 1_000_000);
+        assert!(p.shuffle && p.smart_shuffle);
+        assert_eq!(p.repeat, RepeatMode::Track);
+        assert_eq!(p.context_uri.as_deref(), Some("spotify:playlist:xyz"));
     }
 
     #[test]

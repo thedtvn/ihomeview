@@ -2204,6 +2204,7 @@ dependencies = [
  "nsh-core",
  "nsh-engine",
  "nsh-testing",
+ "objc2",
  "protobuf",
  "rand 0.8.8",
  "reqwest",

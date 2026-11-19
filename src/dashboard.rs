@@ -17,7 +17,7 @@ use chrono::{Datelike, Local, Timelike};
 use nsh_base::theme;
 use nsh_core::{Checked, prelude::*, time::unix_ms};
 
-use crate::spotify::{self, Playback, SpotifyCommand, SpotifyState};
+use crate::spotify::{self, Playback, PlaylistSummary, RepeatMode, SpotifyCommand, SpotifyState};
 
 /// Focus timer presets, in minutes.
 const PRESETS_MIN: [i64; 4] = [5, 15, 25, 45];
@@ -241,6 +241,18 @@ fn spotify_kind(state: &SpotifyState) -> u8 {
 /// The dashboard's root view.
 #[component]
 pub fn Dashboard() -> impl IntoElement {
+    // Spotify: the backend owns the state, the UI only reads it and sends commands.
+    let spotify_state = signal(SpotifyState::SignedOut);
+    spotify::start(spotify_state);
+    dashboard_content(spotify_state, spotify::playlists(), false)
+}
+
+/// The whole screen for a given Spotify state and playlist list (the tests drive it directly).
+fn dashboard_content(
+    spotify_state: Signal<SpotifyState>,
+    playlists: Signal<Vec<PlaylistSummary>>,
+    timer_initially_open: bool,
+) -> impl IntoElement {
     // Clock: local time ticks every 500ms so seconds stay fresh without drift.
     // The interval ends with this view, per https://nsh.dev/docs/reactivity.md#cleanup.
     let now_local = signal(Local::now());
@@ -250,6 +262,7 @@ pub fn Dashboard() -> impl IntoElement {
     let twelve_hour = signal(locale_settings().hour_cycle.twelve_hour());
     let night_dim = signal(false);
     let debug_open = signal(false);
+    let settings_open = signal(false);
 
     let clock_display = computed(move || {
         let dt = now_local.get();
@@ -260,16 +273,12 @@ pub fn Dashboard() -> impl IntoElement {
         format_date(&dt)
     });
 
-    // Spotify: the backend owns the state, the UI only reads it and sends commands.
-    let spotify_state = signal(SpotifyState::SignedOut);
-    spotify::start(spotify_state);
-
     // Focus timer state. Hidden until `timer_open`; see `timer_header_button`.
     // `duration_secs` is the set time (what Reset and finishing go back to).
     let duration_secs = signal(DEFAULT_SECS);
     let remaining_secs = signal(DEFAULT_SECS);
     let running = signal(false);
-    let timer_open = signal(false);
+    let timer_open = signal(timer_initially_open);
     let timer_finished = signal(false);
 
     // Wall-clock countdown: uses a target deadline so system sleep / suspensions
@@ -327,25 +336,31 @@ pub fn Dashboard() -> impl IntoElement {
                     .child(top_band(
                         clock_display,
                         date_display,
-                        twelve_hour,
                         night_dim,
                         debug_open,
+                        settings_open,
                         duration_secs,
                         remaining_secs,
                         running,
                         timer_open,
                     ))
                     .child(
+                        // Landscape: the Music card and the timer panel sit side by side. The
+                        // panel has a fixed width and never shrinks; the card takes what is left
+                        // and rearranges itself (`music_card`) so nothing leaves it.
                         view()
                             .gap(px(20.0))
-                            .style_when(is_landscape, |s| s.flex_1().flex_row())
-                            .child(music_card(spotify_state))
+                            .style_when(is_landscape, |s| s.flex_1().flex_row().min_h(px(0.0)))
+                            .child(music_card(spotify_state, playlists))
                             .child(when(timer_open, move || {
                                 focus_timer_panel(duration_secs, remaining_secs, running)
                             })),
                     ),
             ),
         )
+        .child(when(settings_open, move || {
+            settings_menu(settings_open, night_dim, twelve_hour, debug_open, spotify_state)
+        }))
         .child(night_dim_overlay(night_dim))
         .child(when(timer_finished, move || {
             timer_alert(duration_secs, remaining_secs, running, timer_finished)
@@ -361,9 +376,9 @@ pub fn Dashboard() -> impl IntoElement {
 fn top_band(
     clock_display: Memo<(String, &'static str)>,
     date_display: Memo<String>,
-    twelve_hour: Signal<bool>,
     night_dim: Signal<bool>,
     debug_open: Signal<bool>,
+    settings_open: Signal<bool>,
     duration_secs: Signal<i64>,
     remaining_secs: Signal<i64>,
     running: Signal<bool>,
@@ -373,25 +388,15 @@ fn top_band(
         .gap(px(16.0))
         .style_when(is_landscape, |s| s.flex_row().justify_between().items_start())
         .child(clock_block(clock_display, date_display, debug_open))
+        // The header is just two controls: Timer and Settings.
         .child(
             view()
-                .gap(px(12.0))
-                .style_when(is_landscape, |s| s.w(px(PANEL_W_PT)))
-                .child(
-                    view()
-                        .flex_row()
-                        .flex_wrap()
-                        .gap(px(10.0))
-                        .style_when(is_landscape, |s| s.justify_end())
-                        .child(timer_header_button(
-                            duration_secs,
-                            remaining_secs,
-                            running,
-                            timer_open,
-                        ))
-                        .child(hour_cycle_toggle(twelve_hour))
-                        .child(night_dim_toggle(night_dim)),
-                ),
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(10.0))
+                .child(timer_header_button(duration_secs, remaining_secs, running, timer_open))
+                .child(settings_button(settings_open, night_dim)),
         )
 }
 
@@ -435,57 +440,358 @@ fn header_chip_text(content: &'static str) -> Text {
         .text_color(white())
 }
 
-fn hour_cycle_toggle(twelve_hour: Signal<bool>) -> impl IntoElement {
+// ---------------------------------------------------------------------------------------------
+// Icons: small vector glyphs drawn with NSH's canvas (no font, no image files, no SVG feature).
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Icon {
+    Previous,
+    Next,
+    Play,
+    Pause,
+    Shuffle,
+    /// Shuffle with a sparkle, like Spotify's Smart Shuffle.
+    SmartShuffle,
+    Repeat,
+    /// Repeat with a "1" in the middle: repeat the current track.
+    RepeatOne,
+    Gear,
+    Note,
+}
+
+// Path data on a 24x24 grid.
+const PATH_PREVIOUS: &str = "M6 5h2.4v14H6z M9.6 12 19 5v14z";
+const PATH_NEXT: &str = "M15.6 5H18v14h-2.4z M14.4 12 5 5v14z";
+const PATH_PLAY: &str = "M8 5v14l11-7z";
+const PATH_PAUSE: &str = "M6.5 5h4v14h-4z M13.5 5h4v14h-4z";
+const PATH_SHUFFLE: &str = "M3 7h3.5c2 0 3.2 1 4.3 2.6l2.4 3.8c1.1 1.6 2.3 2.6 4.3 2.6H21 \
+     M3 17h3.5c2 0 3.2-1 4.3-2.6 M21 7h-3.5c-1.6 0-2.7.6-3.6 1.6 \
+     M18 4l3 3-3 3 M18 14l3 3-3 3";
+const PATH_SPARKLE: &str = "M19.5 .5 20.8 3.2 23.5 4.5 20.8 5.8 19.5 8.5 18.2 5.8 15.5 4.5 18.2 3.2z";
+const PATH_REPEAT: &str = "M17 2l4 4-4 4 M3 11v-1a4 4 0 0 1 4-4h14 M7 22l-4-4 4-4 M21 13v1a4 4 0 0 1-4 4H3";
+const PATH_ONE: &str = "M10.6 10.2 12.2 9v6";
+const PATH_NOTE: &str = "M10 3v11.4a3.5 3.5 0 1 0 2 3.1V7h6V3z";
+
+fn icon_painter(icon: Icon, size: f32, color: u32) -> Painter {
+    let c = rgba(color);
+    let p = Painter::new()
+        .save()
+        .scale(size / 24.0, size / 24.0)
+        .fill_style(c)
+        .stroke_style(c)
+        .line_width(2.0_f32)
+        .line_cap(nsh_core::canvas::LineCap::Round)
+        .line_join(nsh_core::canvas::LineJoin::Round);
+    let p = match icon {
+        Icon::Previous => p.fill_svg(PATH_PREVIOUS),
+        Icon::Next => p.fill_svg(PATH_NEXT),
+        Icon::Play => p.fill_svg(PATH_PLAY),
+        Icon::Pause => p.fill_svg(PATH_PAUSE),
+        Icon::Shuffle => p.stroke_svg(PATH_SHUFFLE),
+        Icon::SmartShuffle => p
+            .save()
+            .translate(0.0_f32, 5.0_f32)
+            .scale(0.78_f32, 0.78_f32)
+            .stroke_svg(PATH_SHUFFLE)
+            .restore()
+            .fill_svg(PATH_SPARKLE),
+        Icon::Repeat => p.stroke_svg(PATH_REPEAT),
+        Icon::RepeatOne => p.stroke_svg(PATH_REPEAT).line_width(1.7_f32).stroke_svg(PATH_ONE),
+        Icon::Note => p.fill_svg(PATH_NOTE),
+        Icon::Gear => {
+            // A ring with eight teeth around it.
+            let mut g = p
+                .translate(12.0_f32, 12.0_f32)
+                .line_width(3.8_f32)
+                .begin_path()
+                .arc(0.0_f32, 0.0_f32, 6.4_f32, deg(0.0), deg(360.0))
+                .stroke();
+            for i in 0..8 {
+                g = g
+                    .save()
+                    .rotate(deg(45.0 * i as f32))
+                    .fill_rect(-1.9_f32, -11.6_f32, 3.8_f32, 4.6_f32)
+                    .restore();
+            }
+            g
+        }
+    };
+    p.restore()
+}
+
+/// An icon `size` points square, drawn in `color` (re-drawn when what `color` reads changes).
+fn icon(kind: impl Fn() -> Icon + 'static, size: f32, color: impl Fn() -> u32 + 'static) -> CanvasView {
+    canvas(move || icon_painter(kind(), size, color()))
+        .w(px(size))
+        .h(px(size))
+        .flex_shrink_0()
+        .pointer_events(PointerEvents::None)
+        .accessibility_elements_hidden(true)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Settings: a gear button in the header (tap = menu, hold = night dim) and the menu it opens.
+// ---------------------------------------------------------------------------------------------
+
+fn settings_button(settings_open: Signal<bool>, night_dim: Signal<bool>) -> impl IntoElement {
     view()
         .role(AccessibilityRole::Button)
-        .test_id("hour_cycle_toggle")
-        .label("Switch clock format")
-        .hint(move || {
-            if twelve_hour.get() {
-                "Switches to 24-hour time"
-            } else {
-                "Switches to 12-hour time"
-            }
-        })
-        .on_press(move || twelve_hour.update(|v| *v = !*v))
-        .min_w(px(56.0))
-        .min_h(px(48.0))
-        .px(px(16.0))
+        .test_id("settings_button")
+        .label("Settings")
+        .hint("Opens the settings. Hold to turn night dim on or off.")
+        .on_press(move || settings_open.update(|v| *v = !*v))
+        .on_long_press(move || night_dim.update(|v| *v = !*v))
+        .long_press_delay(600.0)
+        .w(px(52.0))
+        .h(px(52.0))
+        .flex_shrink_0()
         .items_center()
         .justify_center()
         .rounded_full()
         .border_1()
-        .border_color(rgba(0xffffff22))
-        .bg(rgba(0xffffff0f))
+        .border_color(move || if night_dim.get() { rgba(0xffd27888) } else { rgba(0xffffff22) })
+        .bg(move || {
+            if settings_open.get() {
+                rgba(0xffffff2e)
+            } else if night_dim.get() {
+                rgba(0xffd27833)
+            } else {
+                rgba(0xffffff0f)
+            }
+        })
         .active(|s| s.bg(rgba(0xffffff26)))
+        .child(icon(|| Icon::Gear, 26.0, move || if night_dim.get() { AMBER } else { 0xffffffff }))
+}
+
+/// A row with a title and an on/off switch.
+fn settings_switch(
+    test_id: &'static str,
+    title: &'static str,
+    detail: &'static str,
+    on: impl Fn() -> bool + Copy + 'static,
+    toggle: impl Fn() + 'static,
+) -> impl IntoElement {
+    view()
+        .role(AccessibilityRole::Switch)
+        .test_id(test_id)
+        .label(title)
+        .accessibility_state(move || AccessibilityState {
+            checked: Some(if on() { Checked::True } else { Checked::False }),
+            ..AccessibilityState::default()
+        })
+        .on_press(move || toggle())
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .min_h(px(60.0))
+        .px(px(14.0))
+        .rounded(px(14.0))
+        .active(|s| s.bg(rgba(0xffffff12)))
         .child(
-            text(move || if twelve_hour.get() { "12h" } else { "24h" })
-                .text_size(px(16.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(white()),
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(text(title).text_size(px(19.0)).font_weight(FontWeight::MEDIUM).text_color(white()))
+                .child(text(detail).text_size(px(14.0)).text_color(rgba(FAINT))),
+        )
+        .child(
+            view()
+                .w(px(52.0))
+                .h(px(32.0))
+                .p(px(3.0))
+                .flex_row()
+                .items_center()
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(move || if on() { rgba(GREEN) } else { rgba(0xffffff2a) })
+                .style_with(move |s| if on() { s.justify_end() } else { s.justify_start() })
+                .child(view().size(px(26.0)).rounded_full().bg(white())),
         )
 }
 
-fn night_dim_toggle(night_dim: Signal<bool>) -> impl IntoElement {
-    view()
-        .role(AccessibilityRole::Switch)
-        .test_id("night_dim_toggle")
-        .label("Night dim")
-        .accessibility_state(move || AccessibilityState {
-            checked: Some(if night_dim.get() { Checked::True } else { Checked::False }),
-            ..AccessibilityState::default()
-        })
-        .on_press(move || night_dim.update(|v| *v = !*v))
-        .min_w(px(56.0))
-        .min_h(px(48.0))
-        .px(px(16.0))
+/// A row with a title (and a small note) and a pill button on the right.
+fn settings_action(
+    row_id: &'static str,
+    title: &'static str,
+    note: impl Fn() -> String + 'static,
+    button: Option<(&'static str, &'static str, bool, Box<dyn Fn()>)>,
+) -> impl IntoElement {
+    let row = view()
+        .test_id(row_id)
+        .flex_row()
         .items_center()
-        .justify_center()
-        .rounded_full()
-        .border_1()
-        .border_color(rgba(0xffffff22))
-        .bg(move || if night_dim.get() { rgba(0xffd27855) } else { rgba(0xffffff0f) })
-        .child(header_chip_text("Dim"))
+        .justify_between()
+        .gap(px(12.0))
+        .min_h(px(60.0))
+        .px(px(14.0))
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(text(title).text_size(px(19.0)).font_weight(FontWeight::MEDIUM).text_color(white()))
+                .child(
+                    text(note)
+                        .text_size(px(14.0))
+                        .number_of_lines(1)
+                        .text_color(rgba(FAINT)),
+                ),
+        );
+    match button {
+        Some((id, label, danger, on_press)) => row
+            .child(
+                view()
+                    .role(AccessibilityRole::Button)
+                    .test_id(id)
+                    .label(label)
+                    .on_press(move || on_press())
+                    .min_h(px(44.0))
+                    .px(px(18.0))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(if danger { rgba(0xff6b6b88) } else { rgba(0xffffff33) })
+                    .bg(if danger { rgba(0xff6b6b22) } else { rgba(0xffffff12) })
+                    .active(|s| s.opacity(0.75))
+                    .child(
+                        text(label)
+                            .text_size(px(16.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if danger { rgba(0xff8d8dff) } else { rgba(0xffffffff) }),
+                    ),
+            )
+            .into_element(),
+        None => row.into_element(),
+    }
+}
+
+/// The menu the gear opens: a card under the header, with a transparent backdrop that closes it.
+fn settings_menu(
+    settings_open: Signal<bool>,
+    night_dim: Signal<bool>,
+    twelve_hour: Signal<bool>,
+    debug_open: Signal<bool>,
+    spotify_state: Signal<SpotifyState>,
+) -> impl IntoElement {
+    // 0 signed out / problem, 1 signed in, 2 working on it.
+    let account = computed(move || match spotify_state.get() {
+        SpotifyState::Connected(_) => 1u8,
+        SpotifyState::Connecting | SpotifyState::AwaitingApproval { .. } => 2,
+        _ => 0,
+    });
+    let device_note = move || match spotify_state.get() {
+        SpotifyState::Connected(p) => match p.device {
+            Some(d) => format!("Signed in, playing on {d}"),
+            None => "Signed in".to_string(),
+        },
+        SpotifyState::Connecting | SpotifyState::AwaitingApproval { .. } => "Signing in\u{2026}".to_string(),
+        SpotifyState::Unavailable(_) => "Not available in this build".to_string(),
+        SpotifyState::Error(_) => "Sign-in problem".to_string(),
+        SpotifyState::SignedOut => "Not signed in".to_string(),
+    };
+    view()
+        .test_id("settings_menu")
+        .absolute()
+        .inset_0()
+        .child(
+            view()
+                .test_id("settings_backdrop")
+                .role(AccessibilityRole::Button)
+                .label("Close settings")
+                .absolute()
+                .inset_0()
+                .on_press(move || settings_open.set(false)),
+        )
+        .child(
+            view()
+                .test_id("settings_panel")
+                .role(AccessibilityRole::Menu)
+                .absolute()
+                .top(px(92.0))
+                .right(px(24.0))
+                .w(px(360.0))
+                .p(px(10.0))
+                .gap(px(2.0))
+                .rounded(px(24.0))
+                .border_1()
+                .border_color(rgba(0xffffff26))
+                .bg(rgba(0x1b1b1eff))
+                .shadow_2xl()
+                .child(
+                    text("Settings")
+                        .role(AccessibilityRole::Header)
+                        .px(px(14.0))
+                        .py(px(8.0))
+                        .text_size(px(16.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgba(MUTED)),
+                )
+                .child(settings_switch(
+                    "settings_night_dim",
+                    "Night dim",
+                    "Darker screen. Hold the gear to toggle.",
+                    move || night_dim.get(),
+                    move || night_dim.update(|v| *v = !*v),
+                ))
+                .child(settings_switch(
+                    "settings_24h",
+                    "24-hour clock",
+                    "Off shows AM and PM.",
+                    move || !twelve_hour.get(),
+                    move || twelve_hour.update(|v| *v = !*v),
+                ))
+                .child(settings_action(
+                    "settings_debug_row",
+                    "Debug log",
+                    || "Connection and sign-in details".to_string(),
+                    Some((
+                        "settings_debug",
+                        "Open",
+                        false,
+                        Box::new(move || {
+                            settings_open.set(false);
+                            debug_open.set(true);
+                        }),
+                    )),
+                ))
+                .child(view().h(px(1.0)).mx(px(14.0)).my(px(4.0)).bg(rgba(HAIRLINE)))
+                .child(dynamic(move || match account.get() {
+                    1 => settings_action(
+                        "settings_spotify",
+                        "Spotify",
+                        device_note,
+                        Some((
+                            "settings_sign_out",
+                            "Sign out",
+                            true,
+                            Box::new(move || {
+                                settings_open.set(false);
+                                spotify::send(spotify_state, SpotifyCommand::SignOut);
+                            }),
+                        )),
+                    )
+                    .into_element(),
+                    2 => settings_action("settings_spotify", "Spotify", device_note, None).into_element(),
+                    _ => settings_action(
+                        "settings_spotify",
+                        "Spotify",
+                        device_note,
+                        Some((
+                            "settings_sign_in",
+                            "Sign in",
+                            false,
+                            Box::new(move || {
+                                settings_open.set(false);
+                                spotify::send(spotify_state, SpotifyCommand::SignIn);
+                            }),
+                        )),
+                    )
+                    .into_element(),
+                })),
+        )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -577,7 +883,8 @@ fn focus_timer_panel(
         .border_1()
         .border_color(rgba(HAIRLINE))
         .bg(rgba(CARD))
-        .style_when(is_landscape, |s| s.w(px(PANEL_W_PT)))
+        // Fixed width, never squeezed: the Music card is the one that gives way.
+        .style_when(is_landscape, |s| s.w(px(PANEL_W_PT)).flex_shrink_0())
         .child(
             text("Focus timer")
                 .role(AccessibilityRole::Header)
@@ -1105,7 +1412,7 @@ fn state_column(test_id: &'static str) -> View {
         .py(px(24.0))
 }
 
-fn music_card(spotify_state: Signal<SpotifyState>) -> impl IntoElement {
+fn music_card(spotify_state: Signal<SpotifyState>, playlists: Signal<Vec<PlaylistSummary>>) -> impl IntoElement {
     let kind = computed(move || spotify_kind(&spotify_state.get()));
     let playback = computed(move || match spotify_state.get() {
         SpotifyState::Connected(p) => p,
@@ -1120,63 +1427,39 @@ fn music_card(spotify_state: Signal<SpotifyState>) -> impl IntoElement {
         _ => (String::new(), String::new()),
     });
 
+    // The card takes whatever room the row gives it (more or less, with the timer open or
+    // not) and never grows past it: `min_w(0)` lets it shrink below its content, and its
+    // contents (`connected_view`) measure the room and size themselves to fit. It clips as a
+    // last resort so nothing can ever draw over the timer panel.
     view()
         .test_id("music_status")
-        .gap(px(12.0))
-        .p(px(24.0))
+        .gap(px(8.0))
+        .p(px(20.0))
         .rounded(px(28.0))
         .border_1()
         .border_color(rgba(HAIRLINE))
         .bg(rgba(CARD))
-        .style_when(is_landscape, |s| s.flex_1())
+        .overflow_hidden()
+        .style_when(is_landscape, |s| s.flex_1().min_w(px(0.0)).min_h(px(0.0)))
         .child(
-            view()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .min_h(px(48.0))
-                .child(
-                    text("Music")
-                        .role(AccessibilityRole::Header)
-                        .text_size(px(18.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgba(GREEN)),
-                )
-                .child(when(move || kind.get() == 4, move || sign_out_button(spotify_state))),
+            text("Music")
+                .role(AccessibilityRole::Header)
+                .text_size(px(16.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgba(GREEN)),
         )
         .child(
             view()
                 .flex_1()
+                .min_h(px(0.0))
                 .child(dynamic(move || match kind.get() {
                     0 => unavailable_view(message).into_element(),
                     1 => signed_out_view(spotify_state).into_element(),
                     2 => awaiting_view(spotify_state, approval).into_element(),
                     3 => connecting_view().into_element(),
-                    4 => connected_view(spotify_state, playback).into_element(),
+                    4 => connected_view(spotify_state, playback, playlists).into_element(),
                     _ => error_view(spotify_state, message).into_element(),
                 })),
-        )
-}
-
-fn sign_out_button(spotify_state: Signal<SpotifyState>) -> impl IntoElement {
-    view()
-        .role(AccessibilityRole::Button)
-        .test_id("spotify_sign_out")
-        .label("Sign out of Spotify")
-        .on_press(move || spotify::send(spotify_state, SpotifyCommand::SignOut))
-        .min_h(px(48.0))
-        .px(px(20.0))
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .border_1()
-        .border_color(rgba(0xffffff33))
-        .active(|s| s.bg(rgba(0xffffff1a)))
-        .child(
-            text("Sign out")
-                .text_size(px(16.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(white()),
         )
 }
 
@@ -1287,42 +1570,102 @@ fn error_view(spotify_state: Signal<SpotifyState>, message: Memo<String>) -> imp
         ))
 }
 
-fn connected_view(spotify_state: Signal<SpotifyState>, playback: Memo<Playback>) -> impl IntoElement {
+/// What the connected card needs to size itself: its own width and height (set by `on_layout`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Room {
+    w: f32,
+    h: f32,
+}
+
+impl Room {
+    /// Beside the timer panel (or in a small window) the card is narrow: smaller type and art.
+    fn narrow(self) -> bool {
+        self.w > 0.0 && self.w < 720.0
+    }
+
+    /// Side of the album art: as big as the room allows, never wider than 42% of it, and
+    /// leaving the playlist row its space.
+    fn art_side(self, landscape: bool, playlists_h: f32) -> f32 {
+        if self.w <= 0.0 || self.h <= 0.0 {
+            return if landscape { 220.0 } else { 280.0 };
+        }
+        if landscape {
+            (self.h - playlists_h - 8.0).min(self.w * 0.42).clamp(120.0, 380.0)
+        } else {
+            self.w.min(320.0).clamp(160.0, 320.0)
+        }
+    }
+}
+
+/// Height of the playlist row (covers) plus the gap above it.
+const PLAYLIST_COVER_PT: f32 = 72.0;
+const PLAYLIST_ROW_PT: f32 = PLAYLIST_COVER_PT + 14.0;
+
+fn device_line(p: &Playback) -> String {
+    match (&p.device, p.is_playing) {
+        (Some(d), true) => format!("Playing on {d}"),
+        (Some(d), false) => format!("Paused on {d}"),
+        (None, _) => "Paused".to_string(),
+    }
+}
+
+fn connected_view(
+    spotify_state: Signal<SpotifyState>,
+    playback: Memo<Playback>,
+    playlists: Signal<Vec<PlaylistSummary>>,
+) -> impl IntoElement {
     let has_track = computed(move || playback.get().title.is_some());
     let artwork = computed(move || playback.get().artwork_url);
-    let device_line = move || match playback.get().device {
-        Some(d) => format!("Playing on {d}"),
-        None => "No active device".to_string(),
-    };
+    let has_playlists = computed(move || !playlists.get().is_empty());
+    // How much room this view has: the art, type and controls follow it.
+    let room = signal(Room::default());
+    let landscape_now = || is_landscape();
 
     view()
         .test_id("spotify_connected")
         .flex_1()
+        .min_h(px(0.0))
+        .gap(px(14.0))
+        .on_layout(move |b: &Bounds<Points>| {
+            let next = Room { w: b.size.width.0, h: b.size.height.0 };
+            if (next.w - room.get_untracked().w).abs() > 0.5 || (next.h - room.get_untracked().h).abs() > 0.5 {
+                room.set(next);
+            }
+        })
         .child(
             when(move || has_track.get(), move || {
+                let narrow = move || room.get().narrow();
+                let side = move || {
+                    let pl_h = if has_playlists.get() { PLAYLIST_ROW_PT } else { 0.0 };
+                    px(room.get().art_side(landscape_now(), pl_h))
+                };
                 view()
                     .test_id("spotify_track")
                     .flex_1()
-                    .gap(px(28.0))
+                    .min_h(px(0.0))
+                    .gap(px(22.0))
                     .items_center()
-                    .justify_center()
                     .style_when(is_landscape, |s| s.flex_row())
-                    .child(album_art(artwork))
+                    .child(album_art(artwork, side))
                     .child(
                         view()
-                            .gap(px(10.0))
+                            .gap(px(8.0))
+                            .min_w(px(0.0))
+                            .justify_center()
                             .style_when(is_landscape, |s| s.flex_1())
+                            .style_when(|| !is_landscape(), |s| s.w_full())
                             .child(
-                                text(device_line)
+                                text(move || device_line(&playback.get()))
                                     .test_id("spotify_device")
-                                    .text_size(px(18.0))
+                                    .text_size(px(16.0))
+                                    .number_of_lines(1)
                                     .text_color(rgba(GREEN)),
                             )
                             .child(
                                 text(move || playback.get().title.unwrap_or_default())
                                     .test_id("spotify_title")
-                                    .text_size(px(44.0))
-                                    .line_height(px(50.0))
+                                    .text_size(move || if narrow() { px(28.0) } else { px(40.0) })
+                                    .line_height(move || if narrow() { px(33.0) } else { px(46.0) })
                                     .font_weight(FontWeight::BOLD)
                                     .number_of_lines(2)
                                     .text_color(white()),
@@ -1330,23 +1673,24 @@ fn connected_view(spotify_state: Signal<SpotifyState>, playback: Memo<Playback>)
                             .child(
                                 text(move || playback.get().artists.unwrap_or_default())
                                     .test_id("spotify_artists")
-                                    .text_size(px(26.0))
+                                    .text_size(move || if narrow() { px(20.0) } else { px(24.0) })
                                     .number_of_lines(1)
                                     .text_color(rgba(0xffffffd0)),
                             )
                             .child(
                                 text(move || playback.get().album.unwrap_or_default())
                                     .test_id("spotify_album")
-                                    .text_size(px(20.0))
+                                    .text_size(px(17.0))
                                     .number_of_lines(1)
                                     .text_color(rgba(FAINT)),
                             )
-                            .child(progress_block(playback))
+                            .child(progress_block(spotify_state, playback))
                             .child(transport_row(spotify_state, playback)),
                     )
             })
             .otherwise(move || {
                 state_column("spotify_idle")
+                    .min_h(px(0.0))
                     .child(state_title("Nothing playing"))
                     .child(state_note(move || match playback.get().device {
                         Some(d) => format!("{d} is ready. Start a song in Spotify."),
@@ -1355,17 +1699,18 @@ fn connected_view(spotify_state: Signal<SpotifyState>, playback: Memo<Playback>)
                     .child(transport_row(spotify_state, playback))
             }),
         )
+        .child(when(move || has_playlists.get(), move || playlist_row(playback, playlists)))
 }
 
-fn album_art(artwork: Memo<Option<String>>) -> impl IntoElement {
-    let side = || if is_landscape() { px(380.0) } else { px(300.0) };
+fn album_art(artwork: Memo<Option<String>>, side: impl Fn() -> Points + Copy + 'static) -> impl IntoElement {
     when(move || artwork.get().is_some(), move || {
         image(move || artwork.get().unwrap_or_default())
             .test_id("spotify_art")
             .label("Album art")
             .w(side)
             .h(side)
-            .rounded(px(24.0))
+            .flex_shrink_0()
+            .rounded(px(22.0))
             .bg(rgba(0xffffff0f))
     })
     .otherwise(move || {
@@ -1373,40 +1718,128 @@ fn album_art(artwork: Memo<Option<String>>) -> impl IntoElement {
             .test_id("spotify_art_placeholder")
             .w(side)
             .h(side)
-            .rounded(px(24.0))
+            .flex_shrink_0()
+            .rounded(px(22.0))
             .bg(rgba(0xffffff0f))
             .border_1()
             .border_color(rgba(HAIRLINE))
             .items_center()
             .justify_center()
-            .child(
-                text("No artwork")
-                    .text_size(px(18.0))
-                    .text_color(rgba(FAINT)),
-            )
+            .child(icon(|| Icon::Note, 56.0, || 0xffffff40))
     })
 }
 
-fn progress_block(playback: Memo<Playback>) -> impl IntoElement {
+/// The seek bar: drag (or tap) anywhere on it to jump to that point of the track. While the
+/// finger is down the left time shows where it would land; letting go sends the seek.
+fn progress_block(spotify_state: Signal<SpotifyState>, playback: Memo<Playback>) -> impl IntoElement {
+    const HIT_H: f32 = 36.0;
+    const TRACK_H: f32 = 6.0;
+    const THUMB: f32 = 16.0;
+    let can_control = computed(move || playback.get().can_control);
+    let width = signal(0.0_f32);
+    // Fraction under the finger while it is down.
+    let scrub = signal(None::<f32>);
+    // After letting go, the target (ms) shown until the track really gets there, so the bar
+    // does not jump back while Spotify catches up. Cleared by time or by arriving.
+    let landed = signal(None::<(u64, f64)>);
+    let start_x = stored(0.0_f32);
+    let frac_at = move |x: f32| (x / width.get_untracked().max(1.0)).clamp(0.0, 1.0);
+
+    effect(move || {
+        let p = playback.get();
+        if let Some((target, deadline)) = landed.get_untracked() {
+            if p.progress_ms.abs_diff(target) < 3_000 || unix_ms() > deadline {
+                landed.set(None);
+            }
+        }
+    });
+
+    let shown_ms = move || {
+        let p = playback.get();
+        match (scrub.get(), landed.get()) {
+            (Some(f), _) => (f * p.duration_ms as f32) as u64,
+            (None, Some((target, _))) => target,
+            _ => p.progress_ms,
+        }
+    };
+    let shown_frac = move || {
+        let p = playback.get();
+        match (scrub.get(), landed.get()) {
+            (Some(f), _) => f,
+            (None, Some((target, _))) => progress_fraction(target, p.duration_ms),
+            _ => progress_fraction(p.progress_ms, p.duration_ms),
+        }
+    };
+
     view()
-        .gap(px(8.0))
-        .py(px(8.0))
+        .gap(px(2.0))
         .child(
             view()
-                .test_id("spotify_progress")
-                .h(px(8.0))
-                .rounded_full()
-                .overflow_hidden()
-                .bg(rgba(0xffffff22))
+                .test_id("spotify_seek")
+                .role(AccessibilityRole::Adjustable)
+                .label("Track position")
+                .accessibility_value(move || {
+                    Some(nsh_core::AccessibilityValue {
+                        text: Some(format!("{} of {}", format_track_time(shown_ms()), format_track_time(playback.get().duration_ms)).into()),
+                        ..nsh_core::AccessibilityValue::default()
+                    })
+                })
+                .h(px(HIT_H))
+                .justify_center()
+                .on_layout(move |b: &Bounds<Points>| width.set(b.size.width.0))
+                // Takes the finger as soon as it lands, so a tap seeks and a drag scrubs; a page
+                // scroll around it (portrait) cannot steal it.
+                .claim_touches(TouchClaim::on_start())
+                .keep_touches(true)
+                .on_responder_grant(move |e: &ResponderEvent| {
+                    if !can_control.get_untracked() || playback.get_untracked().duration_ms == 0 {
+                        return;
+                    }
+                    start_x.replace(e.location.x.0);
+                    scrub.set(Some(frac_at(e.location.x.0)));
+                })
+                .on_responder_move(move |e: &ResponderEvent| {
+                    if scrub.get_untracked().is_some() {
+                        scrub.set(Some(frac_at(start_x.get() + e.gesture.delta.x.0)));
+                    }
+                })
+                .on_responder_release(move |_: &ResponderEvent| {
+                    if let Some(f) = scrub.get_untracked() {
+                        scrub.set(None);
+                        let target = (f * playback.get_untracked().duration_ms as f32) as u64;
+                        landed.set(Some((target, unix_ms() + 4_000.0)));
+                        spotify::send(spotify_state, SpotifyCommand::SeekTo(target));
+                    }
+                })
+                .on_responder_terminate(move |_: &ResponderEvent| scrub.set(None))
                 .child(
                     view()
-                        .h(px(8.0))
+                        .test_id("spotify_progress")
+                        .h(px(TRACK_H))
                         .rounded_full()
-                        .bg(rgba(GREEN))
-                        .w(move || {
-                            let p = playback.get();
-                            relative(progress_fraction(p.progress_ms, p.duration_ms))
-                        }),
+                        .overflow_hidden()
+                        .bg(rgba(0xffffff22))
+                        .child(
+                            view()
+                                .h(px(TRACK_H))
+                                .rounded_full()
+                                .bg(rgba(GREEN))
+                                .w(move || relative(shown_frac())),
+                        ),
+                )
+                // The handle shows while the bar is held.
+                .child(
+                    view()
+                        .absolute()
+                        .top(px((HIT_H - THUMB) / 2.0))
+                        .left(move || relative(shown_frac()))
+                        .ml(px(-THUMB / 2.0))
+                        .size(px(THUMB))
+                        .rounded_full()
+                        .bg(white())
+                        .opacity(move || if scrub.get().is_some() { 1.0_f32 } else { 0.0_f32 })
+                        .pointer_events(PointerEvents::None)
+                        .accessibility_elements_hidden(true),
                 ),
         )
         .child(
@@ -1414,85 +1847,201 @@ fn progress_block(playback: Memo<Playback>) -> impl IntoElement {
                 .flex_row()
                 .justify_between()
                 .child(
-                    text(move || format_track_time(playback.get().progress_ms))
-                        .text_size(px(16.0))
+                    text(move || format_track_time(shown_ms()))
+                        .test_id("spotify_elapsed")
+                        .text_size(px(15.0))
                         .tabular_nums()
-                        .text_color(rgba(MUTED)),
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(move || if scrub.get().is_some() { rgba(GREEN) } else { rgba(MUTED) }),
                 )
                 .child(
                     text(move || format_track_time(playback.get().duration_ms))
-                        .text_size(px(16.0))
+                        .text_size(px(15.0))
                         .tabular_nums()
                         .text_color(rgba(MUTED)),
                 ),
         )
 }
 
+/// Shuffle: 0 off, 1 shuffle, 2 Smart Shuffle.
+fn shuffle_state(p: &Playback) -> u8 {
+    if p.smart_shuffle {
+        2
+    } else if p.shuffle {
+        1
+    } else {
+        0
+    }
+}
+
 fn transport_row(spotify_state: Signal<SpotifyState>, playback: Memo<Playback>) -> impl IntoElement {
     let can_control = computed(move || playback.get().can_control);
+    let off = 0xffffff99_u32;
+    let on = GREEN;
+    // Five icon buttons that always fit together: 48 + 52 + 68 + 52 + 48 plus four gaps.
     view()
+        .test_id("spotify_transport")
         .flex_row()
         .items_center()
-        .gap(px(16.0))
-        .pt(px(8.0))
-        .child(transport_button(
+        .justify_center()
+        .gap(px(10.0))
+        .pt(px(4.0))
+        .child(icon_button(
+            spotify_state,
+            can_control,
+            SpotifyCommand::ToggleShuffle,
+            "spotify_shuffle",
+            move || {
+                match shuffle_state(&playback.get()) {
+                    2 => "Smart Shuffle on",
+                    1 => "Shuffle on",
+                    _ => "Shuffle off",
+                }
+                .to_string()
+            },
+            move || if shuffle_state(&playback.get()) == 2 { Icon::SmartShuffle } else { Icon::Shuffle },
+            move || if shuffle_state(&playback.get()) == 0 { off } else { on },
+            48.0,
+            26.0,
+            false,
+        ))
+        .child(icon_button(
             spotify_state,
             can_control,
             SpotifyCommand::Previous,
             "spotify_prev",
-            || "Previous",
+            || "Previous".to_string(),
+            || Icon::Previous,
+            || 0xffffffff,
+            52.0,
+            28.0,
             false,
         ))
-        .child(transport_button(
+        .child(icon_button(
             spotify_state,
             can_control,
             SpotifyCommand::PlayPause,
             "spotify_play_pause",
-            move || if playback.get().is_playing { "Pause" } else { "Play" },
+            move || if playback.get().is_playing { "Pause" } else { "Play" }.to_string(),
+            move || if playback.get().is_playing { Icon::Pause } else { Icon::Play },
+            || ON_GREEN,
+            68.0,
+            34.0,
             true,
         ))
-        .child(transport_button(
+        .child(icon_button(
             spotify_state,
             can_control,
             SpotifyCommand::Next,
             "spotify_next",
-            || "Next",
+            || "Next".to_string(),
+            || Icon::Next,
+            || 0xffffffff,
+            52.0,
+            28.0,
+            false,
+        ))
+        .child(icon_button(
+            spotify_state,
+            can_control,
+            SpotifyCommand::CycleRepeat,
+            "spotify_repeat",
+            move || {
+                match playback.get().repeat {
+                    RepeatMode::Off => "Repeat off",
+                    RepeatMode::Context => "Repeat all",
+                    RepeatMode::Track => "Repeat one",
+                }
+                .to_string()
+            },
+            move || if playback.get().repeat == RepeatMode::Track { Icon::RepeatOne } else { Icon::Repeat },
+            move || if playback.get().repeat == RepeatMode::Off { off } else { on },
+            48.0,
+            26.0,
             false,
         ))
 }
 
-fn transport_button(
+/// A round icon-only button. `filled` = the green primary button (play/pause).
+#[allow(clippy::too_many_arguments)]
+fn icon_button(
     spotify_state: Signal<SpotifyState>,
     can_control: Memo<bool>,
     command: SpotifyCommand,
     test_id: &'static str,
-    label: impl Fn() -> &'static str + Clone + 'static,
-    primary: bool,
+    label: impl Fn() -> String + 'static,
+    kind: impl Fn() -> Icon + 'static,
+    color: impl Fn() -> u32 + 'static,
+    side: f32,
+    icon_size: f32,
+    filled: bool,
 ) -> impl IntoElement {
-    let label_for_text = label.clone();
     view()
         .role(AccessibilityRole::Button)
         .test_id(test_id)
-        .label(move || label())
+        .label(label)
         .disabled(move || !can_control.get())
         .opacity(move || if can_control.get() { 1.0_f32 } else { 0.4_f32 })
         .on_press(move || spotify::send(spotify_state, command))
-        .min_h(px(72.0))
-        .min_w(px(if primary { 140.0 } else { 110.0 }))
-        .px(px(24.0))
+        .w(px(side))
+        .h(px(side))
+        .flex_shrink_0()
         .items_center()
         .justify_center()
         .rounded_full()
-        .border_1()
-        .border_color(if primary { rgba(GREEN) } else { rgba(0xffffff33) })
-        .bg(if primary { rgba(GREEN) } else { rgba(0xffffff0f) })
-        .active(|s| s.opacity(0.75))
+        .bg(if filled { rgba(GREEN) } else { rgba(0x00000000) })
+        .active(|s| s.bg(rgba(0xffffff1f)))
+        .child(icon(kind, icon_size, color))
+}
+
+/// A row of square playlist covers for quick play; scrolls sideways through all of them.
+fn playlist_row(playback: Memo<Playback>, playlists: Signal<Vec<PlaylistSummary>>) -> impl IntoElement {
+    scroll()
+        .test_id("spotify_playlists")
+        .horizontal()
+        .scrollbar(false)
+        .h(px(PLAYLIST_COVER_PT + 8.0))
+        .flex_shrink_0()
         .child(
-            text(move || label_for_text())
-                .text_size(px(24.0))
-                .font_weight(FontWeight::BOLD)
-                .text_color(if primary { rgba(ON_GREEN) } else { rgba(0xffffffff) }),
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(12.0))
+                .py(px(4.0))
+                .child(each(playlists, |p: &PlaylistSummary| p.uri.clone(), move |p, _| {
+                    playlist_cover(playback, p)
+                })),
         )
+}
+
+fn playlist_cover(playback: Memo<Playback>, item: ReadSignal<PlaylistSummary>) -> impl IntoElement {
+    let name = move || item.get().name;
+    let playing = move || {
+        let p = playback.get();
+        p.context_uri.is_some() && p.context_uri == Some(item.get().uri)
+    };
+    view()
+        .role(AccessibilityRole::Button)
+        .test_id("spotify_playlist")
+        .label(name)
+        .hint("Plays this playlist")
+        .on_press(move || spotify::play_context(&item.get_untracked().uri))
+        .size(px(PLAYLIST_COVER_PT))
+        .flex_shrink_0()
+        .rounded(px(14.0))
+        .overflow_hidden()
+        .border_2()
+        .border_color(move || if playing() { rgba(GREEN) } else { rgba(0x00000000) })
+        .bg(rgba(0xffffff12))
+        .items_center()
+        .justify_center()
+        .active(|s| s.opacity(0.7))
+        .child(when(move || item.get().image_url.is_some(), move || {
+            image(move || item.get().image_url.unwrap_or_default())
+                .size(px(PLAYLIST_COVER_PT - 4.0))
+                .accessibility_elements_hidden(true)
+        })
+        .otherwise(|| icon(|| Icon::Note, 30.0, || 0xffffff59)))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1648,7 +2197,7 @@ mod tests {
     // Probes render the Music card alone in a given state.
     fn probe(state: SpotifyState) -> impl IntoElement {
         let s = signal(state);
-        view().flex_1().p(px(24.0)).child(music_card(s))
+        view().flex_1().p(px(24.0)).child(music_card(s, spotify::playlists()))
     }
 
     #[component]
@@ -1686,6 +2235,7 @@ mod tests {
             progress_ms: 61_000,
             duration_ms: 180_000,
             can_control: false,
+            ..Playback::default()
         }))
     }
 
@@ -1702,6 +2252,87 @@ mod tests {
     #[component]
     fn ProbeNothingPlaying() -> impl IntoElement {
         probe(SpotifyState::Connected(Playback::default()))
+    }
+
+    fn controllable() -> Playback {
+        Playback {
+            device: Some("Windows PC".into()),
+            title: Some("Test Song".into()),
+            artists: Some("Test Artist".into()),
+            album: Some("Test Album".into()),
+            is_playing: true,
+            progress_ms: 0,
+            duration_ms: 200_000,
+            can_control: true,
+            ..Playback::default()
+        }
+    }
+
+    #[component]
+    fn ProbeShuffleOn() -> impl IntoElement {
+        probe(SpotifyState::Connected(Playback {
+            shuffle: true,
+            repeat: crate::spotify::RepeatMode::Context,
+            ..controllable()
+        }))
+    }
+
+    #[component]
+    fn ProbeSmartShuffle() -> impl IntoElement {
+        probe(SpotifyState::Connected(Playback {
+            shuffle: true,
+            smart_shuffle: true,
+            repeat: crate::spotify::RepeatMode::Track,
+            ..controllable()
+        }))
+    }
+
+    #[component]
+    fn ProbePausedNoDevice() -> impl IntoElement {
+        probe(SpotifyState::Connected(Playback {
+            device: None,
+            title: Some("Paused Song".into()),
+            artists: Some("Someone".into()),
+            is_playing: false,
+            can_control: true,
+            duration_ms: 180_000,
+            progress_ms: 30_000,
+            ..Playback::default()
+        }))
+    }
+
+    #[component]
+    fn ProbeSeekable() -> impl IntoElement {
+        probe(SpotifyState::Connected(controllable()))
+    }
+
+    fn many_playlists(n: usize) -> Vec<PlaylistSummary> {
+        (0..n)
+            .map(|i| PlaylistSummary {
+                uri: format!("spotify:playlist:{i}"),
+                name: if i == 0 { "Liked Songs".to_string() } else { format!("Playlist {i}") },
+                image_url: None,
+            })
+            .collect()
+    }
+
+    #[component]
+    fn ProbeWithPlaylists() -> impl IntoElement {
+        let s = signal(SpotifyState::Connected(controllable()));
+        let list = signal(many_playlists(20));
+        view().flex_1().p(px(24.0)).child(music_card(s, list))
+    }
+
+    #[component]
+    fn FullTimerOpen() -> impl IntoElement {
+        let s = signal(SpotifyState::Connected(controllable()));
+        dashboard_content(s, signal(many_playlists(12)), true)
+    }
+
+    #[component]
+    fn FullTimerClosed() -> impl IntoElement {
+        let s = signal(SpotifyState::Connected(controllable()));
+        dashboard_content(s, signal(many_playlists(12)), false)
     }
 
     #[test]
@@ -1948,7 +2579,7 @@ mod tests {
     fn landscape_layout_fills_the_screen() {
         let mut app = start_landscape();
         app.wait_for("id:music_status").unwrap();
-        app.wait_for("id:night_dim_toggle").unwrap();
+        app.wait_for("id:settings_button").unwrap();
         let nodes = app.screen().layout_nodes();
         let find = |id: &str| {
             nodes
@@ -1958,7 +2589,7 @@ mod tests {
                 .bounds
         };
         let music = find("music_status");
-        let controls = find("night_dim_toggle");
+        let controls = find("settings_button");
         let clock = find("clock_time");
         // Music is the big content: most of the width, most of the height left under the clock.
         assert!(music.size.width.0 > 900.0, "music width {:?}", music.size);
@@ -2033,23 +2664,346 @@ mod tests {
         app.wait_for("id:spotify_art_placeholder").unwrap();
         app.wait_for("01:01").unwrap();
         app.wait_for("03:00").unwrap();
-        // Playing, so the middle button offers Pause; all three are off without control.
-        app.wait_for("Pause").unwrap();
-        for id in ["id:spotify_prev", "id:spotify_play_pause", "id:spotify_next"] {
+        // Playing, so the middle button offers Pause; all of them are off without control.
+        app.wait_for("label:Pause").unwrap();
+        for id in CONTROL_IDS {
             assert_eq!(app.screen().enabled(id).unwrap(), false, "{id} should be disabled");
         }
-        app.wait_for("id:spotify_sign_out").unwrap();
+        // Sign out lives in the settings menu now, not on the Music card.
+        assert_eq!(app.screen().count("id:spotify_sign_out").unwrap(), 0);
+        assert_eq!(app.screen().count("text:Sign out").unwrap(), 0);
     }
+
+    const CONTROL_IDS: [&str; 5] = [
+        "id:spotify_shuffle",
+        "id:spotify_prev",
+        "id:spotify_play_pause",
+        "id:spotify_next",
+        "id:spotify_repeat",
+    ];
 
     #[test]
     fn music_connected_enables_controls_when_allowed() {
         let mut app = Headless::start(landscape_config(Root::of::<ProbeConnectedControllable>())).unwrap();
         app.wait_for("Test Song").unwrap();
-        app.wait_for("Play").unwrap();
-        for id in ["id:spotify_prev", "id:spotify_play_pause", "id:spotify_next"] {
+        app.wait_for("label:Play").unwrap();
+        for id in CONTROL_IDS {
             assert_eq!(app.screen().enabled(id).unwrap(), true, "{id} should be enabled");
         }
+        // Icons only: no words on the transport buttons.
+        for word in ["Previous", "Next", "Shuffle off", "Repeat off"] {
+            assert_eq!(app.screen().count(&format!("text:{word}")).unwrap(), 0, "{word} shown as text");
+        }
+        app.wait_for("label:Shuffle off").unwrap();
+        app.wait_for("label:Repeat off").unwrap();
         app.press("id:spotify_play_pause").unwrap();
+        app.press("id:spotify_shuffle").unwrap();
+        app.press("id:spotify_repeat").unwrap();
+    }
+
+    #[test]
+    fn shuffle_and_repeat_show_every_state() {
+        let mut app = Headless::start(landscape_config(Root::of::<ProbeShuffleOn>())).unwrap();
+        app.wait_for("label:Shuffle on").unwrap();
+        app.wait_for("label:Repeat all").unwrap();
+        let mut app = Headless::start(landscape_config(Root::of::<ProbeSmartShuffle>())).unwrap();
+        app.wait_for("label:Smart Shuffle on").unwrap();
+        app.wait_for("label:Repeat one").unwrap();
+    }
+
+    #[test]
+    fn a_paused_track_with_no_active_device_is_still_shown() {
+        let mut app = Headless::start(landscape_config(Root::of::<ProbePausedNoDevice>())).unwrap();
+        app.wait_for("id:spotify_track").unwrap();
+        app.wait_for("Paused Song").unwrap();
+        app.wait_for("Paused").unwrap();
+        app.wait_for("label:Play").unwrap();
+        assert_eq!(app.screen().count("id:spotify_idle").unwrap(), 0);
+        assert_eq!(app.screen().count("text:Nothing playing").unwrap(), 0);
+        assert!(app.screen().enabled("id:spotify_play_pause").unwrap());
+    }
+
+    #[test]
+    fn dragging_the_time_bar_seeks_and_shows_the_target_time() {
+        let mut app = Headless::start(landscape_config(Root::of::<ProbeSeekable>())).unwrap();
+        app.wait_for("id:spotify_seek").unwrap();
+        app.wait_for("id:spotify_elapsed").unwrap();
+        assert!(app.screen().texts().contains(&"00:00"), "starts at 0:00: {:?}", app.screen().texts());
+        let bar = app.screen().layout_nodes().into_iter().find(|n| n.test_id.as_deref() == Some("spotify_seek")).unwrap().bounds;
+        eprintln!("seek bar: {bar:?}");
+        // From the middle of the bar to 100 points further right: past halfway of a 200 s track.
+        app.drag("id:spotify_seek", nsh_core::geometry::point(px(100.0), px(0.0))).unwrap();
+        let texts = app.screen().texts().into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let elapsed = texts
+            .iter()
+            .find(|t| t.len() == 5 && t.as_bytes()[2] == b':' && t.as_str() != "03:20")
+            .cloned()
+            .unwrap_or_default();
+        eprintln!("elapsed after the drag: {elapsed}");
+        let secs: u32 = elapsed[..2].parse::<u32>().unwrap() * 60 + elapsed[3..].parse::<u32>().unwrap();
+        assert!(secs > 100 && secs <= 200, "seek target {elapsed} is not past the middle");
+        // A seek is refused (and the bar stays put) while controls are locked.
+        let mut app = Headless::start(landscape_config(Root::of::<ProbeConnectedLocked>())).unwrap();
+        app.wait_for("id:spotify_seek").unwrap();
+        app.drag("id:spotify_seek", nsh_core::geometry::point(px(100.0), px(0.0))).unwrap();
+        app.wait_for("01:01").unwrap();
+    }
+
+    #[test]
+    fn playlists_show_as_a_row_of_covers_that_scrolls() {
+        let mut app = Headless::start(landscape_config(Root::of::<ProbeWithPlaylists>())).unwrap();
+        app.wait_for("id:spotify_playlists").unwrap();
+        assert_eq!(app.screen().count("id:spotify_playlist").unwrap() >= 6, true);
+        app.wait_for("label:Liked Songs").unwrap();
+        let nodes = app.screen().layout_nodes();
+        let row = nodes.iter().find(|n| n.test_id.as_deref() == Some("spotify_playlists")).unwrap();
+        let music = nodes.iter().find(|n| n.test_id.as_deref() == Some("music_status")).unwrap();
+        let scroll = row.scroll.as_ref().expect("the playlist row scrolls");
+        eprintln!("playlist row {:?}, scroll {scroll:?}", row.bounds);
+        assert!(row.bounds.origin.x.0 >= music.bounds.origin.x.0 - 0.5);
+        assert!(row.bounds.origin.x.0 + row.bounds.size.width.0 <= music.bounds.origin.x.0 + music.bounds.size.width.0 + 0.5);
+        // 20 covers do not fit: the row scrolls sideways to reach them.
+        app.scroll("id:spotify_playlists", px(300.0)).unwrap();
+        // Tapping a cover plays it.
+        app.press("label:Liked Songs").unwrap_or(());
+        app.press("id:spotify_playlist").unwrap_err();
+    }
+
+    #[test]
+    fn playlists_are_hidden_when_there_are_none() {
+        let mut app = Headless::start(landscape_config(Root::of::<ProbeConnectedControllable>())).unwrap();
+        app.wait_for("Test Song").unwrap();
+        assert_eq!(app.screen().count("id:spotify_playlists").unwrap(), 0);
+    }
+
+    // ----- Layout: nothing overlaps or leaves the screen, timer open or not -----
+
+    type Rect = (f32, f32, f32, f32);
+
+    fn rects(app: &Headless, ids: &[&str]) -> Vec<(String, Rect)> {
+        let nodes = app.screen().layout_nodes();
+        ids.iter()
+            .map(|id| {
+                let n = nodes
+                    .iter()
+                    .find(|n| n.test_id.as_deref() == Some(*id))
+                    .unwrap_or_else(|| panic!("no node {id}"));
+                let b = n.bounds;
+                (id.to_string(), (b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0))
+            })
+            .collect()
+    }
+
+    fn inside(r: Rect, outer: Rect) -> bool {
+        r.0 >= outer.0 - 0.5 && r.1 >= outer.1 - 0.5 && r.0 + r.2 <= outer.0 + outer.2 + 0.5 && r.1 + r.3 <= outer.1 + outer.3 + 0.5
+    }
+
+    fn overlaps(a: Rect, b: Rect) -> bool {
+        a.0 < b.0 + b.2 - 0.5 && b.0 < a.0 + a.2 - 0.5 && a.1 < b.1 + b.3 - 0.5 && b.1 < a.1 + a.3 - 0.5
+    }
+
+    const MUSIC_CONTROLS: [&str; 7] = [
+        "spotify_shuffle",
+        "spotify_prev",
+        "spotify_play_pause",
+        "spotify_next",
+        "spotify_repeat",
+        "spotify_seek",
+        "spotify_playlists",
+    ];
+    const TIMER_CONTROLS: [&str; 6] = [
+        "timer_toggle",
+        "timer_reset",
+        "timer_preset_5",
+        "timer_preset_45",
+        "timer_editor",
+        "timer_panel",
+    ];
+
+    fn check_no_overlap(app: &Headless, w: f32, h: f32, timer_open: bool) {
+        let window = (0.0, 0.0, w, h);
+        let mut ids: Vec<&str> = MUSIC_CONTROLS.to_vec();
+        ids.extend(["music_status", "spotify_art", "spotify_art_placeholder", "spotify_title", "clock_time", "settings_button"]);
+        if timer_open {
+            ids.extend(TIMER_CONTROLS);
+        }
+        let ids: Vec<&str> = ids
+            .into_iter()
+            .filter(|id| app.screen().count(&format!("id:{id}")).unwrap_or(0) > 0)
+            .collect();
+        let found = rects(app, &ids);
+        let get = |id: &str| found.iter().find(|(i, _)| i == id).map(|(_, r)| *r);
+        for (id, r) in &found {
+            eprintln!("  {id:>26}: x {:7.1} y {:7.1} w {:7.1} h {:7.1}", r.0, r.1, r.2, r.3);
+        }
+        // Everything is on the screen.
+        for (id, r) in &found {
+            assert!(inside(*r, window), "{id} {r:?} leaves the {w}x{h} window");
+        }
+        // The music controls stay inside the Music card.
+        let card = get("music_status").unwrap();
+        for id in MUSIC_CONTROLS {
+            if let Some(r) = get(id) {
+                assert!(inside(r, card), "{id} {r:?} leaves the music card {card:?}");
+            }
+        }
+        // The artwork and the controls do not overlap each other.
+        let art = get("spotify_art").or_else(|| get("spotify_art_placeholder"));
+        if let Some(art) = art {
+            for id in MUSIC_CONTROLS {
+                if let Some(r) = get(id) {
+                    assert!(!overlaps(art, r), "artwork {art:?} overlaps {id} {r:?}");
+                }
+            }
+        }
+        // The transport buttons and the seek bar do not overlap one another.
+        for (i, a) in MUSIC_CONTROLS[..6].iter().enumerate() {
+            for b in &MUSIC_CONTROLS[i + 1..6] {
+                if let (Some(ra), Some(rb)) = (get(a), get(b)) {
+                    assert!(!overlaps(ra, rb), "{a} {ra:?} overlaps {b} {rb:?}");
+                }
+            }
+        }
+        if timer_open {
+            let panel = get("timer_panel").unwrap();
+            assert!(!overlaps(card, panel), "music card {card:?} overlaps the timer panel {panel:?}");
+            // (While the countdown runs the picker is replaced by the big time, so not every
+            // timer control is always on screen.)
+            for id in MUSIC_CONTROLS.iter().chain(["spotify_title"].iter()) {
+                if let Some(m) = get(id) {
+                    for t in TIMER_CONTROLS {
+                        if let Some(tr) = get(t) {
+                            assert!(!overlaps(m, tr), "{id} {m:?} overlaps {t} {tr:?}");
+                        }
+                    }
+                }
+            }
+            for t in TIMER_CONTROLS {
+                if let Some(tr) = get(t) {
+                    assert!(inside(tr, panel), "{t} {tr:?} leaves the timer panel {panel:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn landscape_with_the_timer_open_has_no_overlap() {
+        let mut app = Headless::start(landscape_config(Root::of::<FullTimerOpen>())).unwrap();
+        app.wait_for("id:timer_panel").unwrap();
+        app.wait_for("id:spotify_play_pause").unwrap();
+        eprintln!("1024x768, timer open, track playing, playlists shown:");
+        check_no_overlap(&app, 1024.0, 768.0, true);
+        // Running countdown keeps the same panel size and still does not touch the music card.
+        app.press("id:timer_toggle").unwrap();
+        app.wait_for("id:timer_remaining").unwrap();
+        check_no_overlap(&app, 1024.0, 768.0, true);
+    }
+
+    #[test]
+    fn landscape_with_the_timer_closed_has_no_overlap() {
+        let mut app = Headless::start(landscape_config(Root::of::<FullTimerClosed>())).unwrap();
+        app.wait_for("id:spotify_play_pause").unwrap();
+        eprintln!("1024x768, timer closed:");
+        check_no_overlap(&app, 1024.0, 768.0, false);
+        // Opening the timer from the header gives the same safe layout.
+        app.press("id:timer_open").unwrap();
+        app.wait_for("id:timer_panel").unwrap();
+        eprintln!("1024x768, timer just opened:");
+        check_no_overlap(&app, 1024.0, 768.0, true);
+        app.press("id:timer_open").unwrap();
+        app.wait_for_gone("id:timer_panel", Duration::from_secs(5)).unwrap();
+        check_no_overlap(&app, 1024.0, 768.0, false);
+    }
+
+    #[test]
+    fn portrait_with_the_timer_open_has_no_overlap() {
+        let mut config = EngineConfig::new(Root::of::<FullTimerOpen>());
+        config.viewport = Size::new(Points(768.0), Points(1024.0));
+        config.environment.window = config.viewport;
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("id:timer_panel").unwrap();
+        app.wait_for("id:spotify_play_pause").unwrap();
+        eprintln!("768x1024 portrait, timer open:");
+        // Portrait scrolls, so only check that rows do not overlap and nothing is wider than the window.
+        let found = rects(&app, &["spotify_play_pause", "spotify_seek", "timer_panel", "music_status", "timer_toggle", "spotify_shuffle", "spotify_repeat"]);
+        for (id, r) in &found {
+            eprintln!("  {id:>26}: x {:7.1} y {:7.1} w {:7.1} h {:7.1}", r.0, r.1, r.2, r.3);
+            assert!(r.0 >= -0.5 && r.0 + r.2 <= 768.5, "{id} {r:?} is wider than the window");
+        }
+        let get = |id: &str| found.iter().find(|(i, _)| i == id).unwrap().1;
+        assert!(!overlaps(get("music_status"), get("timer_panel")), "card and timer overlap in portrait");
+        let (shuffle, repeat, play) = (get("spotify_shuffle"), get("spotify_repeat"), get("spotify_play_pause"));
+        assert!(!overlaps(shuffle, play) && !overlaps(repeat, play));
+    }
+
+    // ----- Settings -----
+
+    #[test]
+    fn the_header_has_only_timer_and_settings() {
+        let mut app = start_landscape();
+        app.wait_for("id:settings_button").unwrap();
+        app.wait_for("id:timer_open").unwrap();
+        for gone in ["id:night_dim_toggle", "id:hour_cycle_toggle", "text:Dim", "text:24h", "text:12h"] {
+            assert_eq!(app.screen().count(gone).unwrap(), 0, "{gone} is still in the header");
+        }
+        assert_eq!(app.screen().count("id:settings_menu").unwrap(), 0);
+    }
+
+    #[test]
+    fn settings_menu_holds_dim_clock_debug_and_the_account() {
+        let mut app = Headless::start(landscape_config(Root::of::<FullTimerClosed>())).unwrap();
+        app.wait_for("id:settings_button").unwrap();
+        app.press("id:settings_button").unwrap();
+        app.wait_for("id:settings_menu").unwrap();
+        for id in ["id:settings_night_dim", "id:settings_24h", "id:settings_debug", "id:settings_sign_out"] {
+            app.wait_for(id).unwrap();
+        }
+        let rs = rects(&app, &["settings_panel", "settings_button"]);
+        eprintln!("settings panel {:?}", rs[0].1);
+        assert!(inside(rs[0].1, (0.0, 0.0, 1024.0, 768.0)));
+        // Night dim switch.
+        let checked = |app: &Headless, id: &str| app.screen().accessibility_state(id).unwrap().checked;
+        assert_eq!(checked(&app, "id:settings_night_dim"), Some(Checked::False));
+        app.press("id:settings_night_dim").unwrap();
+        assert_eq!(checked(&app, "id:settings_night_dim"), Some(Checked::True));
+        // 24-hour clock switch.
+        let before = checked(&app, "id:settings_24h");
+        app.press("id:settings_24h").unwrap();
+        assert_ne!(checked(&app, "id:settings_24h"), before);
+        // Tapping outside closes the menu.
+        app.press("id:settings_backdrop").unwrap();
+        app.wait_for_gone("id:settings_menu", Duration::from_secs(5)).unwrap();
+        // The gear again; Debug log opens the existing overlay and closes the menu.
+        app.press("id:settings_button").unwrap();
+        app.press("id:settings_debug").unwrap();
+        app.wait_for("id:debug_overlay").unwrap();
+        assert_eq!(app.screen().count("id:settings_menu").unwrap(), 0);
+        app.press("id:debug_close").unwrap();
+        app.wait_for_gone("id:debug_overlay", Duration::from_secs(5)).unwrap();
+        // Sign out from the menu returns to the signed-out card.
+        app.press("id:settings_button").unwrap();
+        app.press("id:settings_sign_out").unwrap();
+        app.wait_for_gone("id:settings_menu", Duration::from_secs(5)).unwrap();
+        app.wait_for("id:spotify_signed_out").unwrap();
+        app.press("id:settings_button").unwrap();
+        app.wait_for("id:settings_sign_in").unwrap();
+        assert_eq!(app.screen().count("id:settings_sign_out").unwrap(), 0);
+    }
+
+    #[test]
+    fn holding_the_gear_toggles_night_dim_and_a_tap_opens_the_menu() {
+        let mut app = start_landscape();
+        app.wait_for("id:settings_button").unwrap();
+        app.long_press("id:settings_button").unwrap();
+        // A long press is not a tap: the menu stays closed...
+        assert_eq!(app.screen().count("id:settings_menu").unwrap(), 0);
+        // ...and dim is now on.
+        app.press("id:settings_button").unwrap();
+        app.wait_for("id:settings_menu").unwrap();
+        assert_eq!(
+            app.screen().accessibility_state("id:settings_night_dim").unwrap().checked,
+            Some(Checked::True)
+        );
     }
 
     #[test]

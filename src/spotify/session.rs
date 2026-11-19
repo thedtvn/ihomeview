@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use crate::debug_log as dlog;
 
 use super::{
-    Playback,
+    Playback, PlaylistSummary,
     connect::{self, RemoteCommand, TrackInfo},
 };
 
@@ -30,6 +30,8 @@ pub enum Login {
     Token(String),
     /// Later launches: Spotify's reusable stored credential from an earlier login.
     Stored { username: String, auth_data: Vec<u8> },
+    /// Fallback: the OAuth refresh token from pairing, exchanged for a fresh access token.
+    Refresh(String),
 }
 
 impl std::fmt::Debug for Login {
@@ -37,6 +39,7 @@ impl std::fmt::Debug for Login {
         match self {
             Login::Token(_) => f.write_str("OAuthToken(<hidden>)"),
             Login::Stored { username, auth_data } => write!(f, "Stored({username}, {} bytes)", auth_data.len()),
+            Login::Refresh(_) => f.write_str("RefreshToken(<hidden>)"),
         }
     }
 }
@@ -46,6 +49,10 @@ impl std::fmt::Debug for Login {
 pub enum Event {
     /// Spotify's reusable credential to persist (replaces the password).
     Credentials { username: String, auth_data: Vec<u8> },
+    /// A (possibly rotated) OAuth refresh token to persist.
+    RefreshToken(String),
+    /// The user's playlists for quick play (Liked Songs first).
+    Playlists(Vec<PlaylistSummary>),
     Playback(Playback),
     /// A recoverable error with a short user-facing message.
     Error(String),
@@ -121,7 +128,7 @@ async fn resolve_track(session: &Session, uri: &str) -> Option<TrackInfo> {
     })
 }
 
-async fn send_command(session: &Session, own_id: &str, target: &str, cmd: RemoteCommand) -> Result<(), String> {
+async fn send_command(session: &Session, own_id: &str, target: &str, cmd: &RemoteCommand) -> Result<(), String> {
     session
         .spclient()
         .request_as_json(
@@ -149,6 +156,40 @@ fn login_failure(err: &librespot::core::Error) -> (String, bool) {
     } else {
         (format!("Spotify login failed ({}).", short(err)), false)
     }
+}
+
+/// The user's playlists from the rootlist (`/playlist/v2/user/{me}/rootlist`), Liked Songs first.
+async fn load_playlists(session: &Session) -> Result<Vec<PlaylistSummary>, String> {
+    use librespot::protocol::playlist4_external::SelectedListContent;
+    let bytes = session.spclient().get_rootlist(0, Some(120)).await.map_err(short)?;
+    let root = SelectedListContent::parse_from_bytes(&bytes).map_err(short)?;
+    let mut out = vec![PlaylistSummary {
+        uri: format!("spotify:user:{}:collection", session.username()),
+        name: "Liked Songs".into(),
+        image_url: None,
+    }];
+    let contents = root.contents.as_ref();
+    let items = contents.map(|c| c.items.as_slice()).unwrap_or_default();
+    let metas = contents.map(|c| c.meta_items.as_slice()).unwrap_or_default();
+    for (i, item) in items.iter().enumerate() {
+        let uri = item.uri.clone().unwrap_or_default();
+        if !uri.starts_with("spotify:playlist:") {
+            continue; // folders are "spotify:start-group/end-group"
+        }
+        let attrs = metas.get(i).and_then(|m| m.attributes.as_ref());
+        let name = attrs.and_then(|a| a.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| "Playlist".into());
+        let image_url = attrs.and_then(|a| {
+            a.picture_size
+                .iter()
+                .find(|p| p.target_name.as_deref() == Some("default"))
+                .or_else(|| a.picture_size.first())
+                .and_then(|p| p.url.clone())
+                .filter(|u| u.starts_with("https://"))
+                .or_else(|| a.picture.as_ref().filter(|p| p.len() == 20).map(|p| format!("https://i.scdn.co/image/{}", hex::encode(p))))
+        });
+        out.push(PlaylistSummary { uri, name, image_url });
+    }
+    Ok(out)
 }
 
 /// Runs one session until it ends. `device_id` is the persisted observer id.
@@ -183,6 +224,36 @@ pub async fn run(
         Login::Token(token) => {
             dlog::info("step 1/4: using OAuth access token from Spotify's login page");
             Credentials::with_access_token(token)
+        }
+        Login::Refresh(refresh) => {
+            dlog::info("step 1/4: refreshing access token with the saved refresh token");
+            let client = match librespot::oauth::DeviceAuthClientBuilder::new(super::PAIR_CLIENT_ID, super::PAIR_SCOPES.to_vec()).build() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = events.send(ended(Some(format!("Spotify sign-in unavailable ({e}).")), false));
+                    return;
+                }
+            };
+            match tokio::time::timeout(STEP_TIMEOUT, client.refresh_token_async(&refresh)).await {
+                Ok(Ok(token)) => {
+                    dlog::info("step 1/4 ok: access token refreshed");
+                    if !token.refresh_token.is_empty() && token.refresh_token != refresh {
+                        let _ = events.send(Event::RefreshToken(token.refresh_token.clone()));
+                    }
+                    Credentials::with_access_token(token.access_token)
+                }
+                Ok(Err(e)) => {
+                    dlog::error(format!("refresh token rejected: {e:?}"));
+                    let text = e.to_string();
+                    let bad = text.contains("invalid_grant") || text.contains("invalid_client");
+                    let _ = events.send(ended(Some(format!("Spotify sign-in expired ({}).", short(&e))), bad));
+                    return;
+                }
+                Err(_) => {
+                    let _ = events.send(ended(Some("Refreshing the Spotify login timed out.".into()), false));
+                    return;
+                }
+            }
         }
         Login::Stored { username, auth_data } => {
             dlog::info("step 1/4: using saved stored credential");
@@ -260,9 +331,18 @@ pub async fn run(
         }
     }
     dlog::info("step 4/4: waiting for connection id to register hidden observer");
+    match load_playlists(&session).await {
+        Ok(list) => {
+            dlog::info(format!("playlists: {} loaded", list.len()));
+            let _ = events.send(Event::Playlists(list));
+        }
+        Err(e) => dlog::warn(format!("playlists: could not load ({e})")),
+    }
 
     let mut observed = Observed { cluster: None, extra: None };
     let mut registered = false;
+    // The last device that was active (commands go there while nothing is active).
+    let mut last_active: Option<String> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let _ = events.send(Event::Playback(Playback::default()));
@@ -295,6 +375,16 @@ pub async fn run(
                                     cluster.device.len(),
                                     cluster.active_device_id
                                 ));
+                                if !cluster.active_device_id.is_empty() {
+                                    last_active = Some(cluster.active_device_id.clone());
+                                } else {
+                                    // Nothing active at start: the only other player device is the target.
+                                    last_active = cluster
+                                        .device
+                                        .iter()
+                                        .find(|(id, d)| *id != &device_id && d.can_play)
+                                        .map(|(id, _)| id.clone());
+                                }
                                 observed.cluster = Some(cluster);
                             }
                             Err(e) => dlog::warn(format!("observer registered; cluster parse failed: {e}")),
@@ -317,6 +407,7 @@ pub async fn run(
                             if observed.cluster.as_ref().map(|c| &c.active_device_id) != Some(&cluster.active_device_id) {
                                 dlog::info(format!("cluster: active device now '{}'", cluster.active_device_id));
                             }
+                            if !cluster.active_device_id.is_empty() { last_active = Some(cluster.active_device_id.clone()); }
                             observed.cluster = Some(cluster);
                         }
                     }
@@ -328,10 +419,18 @@ pub async fn run(
                     None | Some(Request::Stop) => break,
                     Some(Request::Command(cmd)) => {
                         dlog::info(format!("command {cmd:?}"));
-                        let target = observed.cluster.as_ref().map(|c| c.active_device_id.clone()).unwrap_or_default();
+                        // After a pause Spotify clears the active device; the device that was
+                        // playing still accepts resume/seek/play (verified live), so fall back to it.
+                        let target = observed
+                            .cluster
+                            .as_ref()
+                            .map(|c| c.active_device_id.clone())
+                            .filter(|t| !t.is_empty())
+                            .or_else(|| last_active.clone())
+                            .unwrap_or_default();
                         if !registered || target.is_empty() || target == device_id {
                             let _ = events.send(Event::Error("No active Spotify device to control.".into()));
-                        } else if let Err(e) = send_command(&session, &device_id, &target, cmd).await {
+                        } else if let Err(e) = send_command(&session, &device_id, &target, &cmd).await {
                             dlog::error(format!("command failed: {e}"));
                             let _ = events.send(Event::Error(format!("Command failed ({e}).")));
                         } else {

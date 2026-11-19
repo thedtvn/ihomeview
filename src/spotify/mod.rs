@@ -49,6 +49,45 @@ pub struct Playback {
     pub duration_ms: u64,
     /// Whether play/pause/next/previous are currently accepted for the active device.
     pub can_control: bool,
+    /// Shuffle is on for the current context (also true with Smart Shuffle).
+    pub shuffle: bool,
+    /// Smart Shuffle (shuffle + recommendations): `modes.context_enhancement = RECOMMENDATION`.
+    pub smart_shuffle: bool,
+    pub repeat: RepeatMode,
+    /// The playing context (playlist/album) URI, when Spotify reports one.
+    pub context_uri: Option<String>,
+}
+
+/// Repeat state of the active device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    /// Repeat the playlist/album.
+    Context,
+    /// Repeat the current track.
+    Track,
+}
+
+impl RepeatMode {
+    /// Spotify's order when tapping repeat: off -> context -> track -> off.
+    pub fn next(self) -> Self {
+        match self {
+            RepeatMode::Off => RepeatMode::Context,
+            RepeatMode::Context => RepeatMode::Track,
+            RepeatMode::Track => RepeatMode::Off,
+        }
+    }
+}
+
+/// One of the user's playlists (or Liked Songs) for quick play.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaylistSummary {
+    /// `spotify:playlist:...` or `spotify:user:<name>:collection` (Liked Songs).
+    pub uri: String,
+    pub name: String,
+    /// HTTPS cover image, when the playlist has one.
+    pub image_url: Option<String>,
 }
 
 /// User actions sent from the dashboard to the backend.
@@ -60,6 +99,12 @@ pub enum SpotifyCommand {
     PlayPause,
     Next,
     Previous,
+    /// Spotify's shuffle button: off -> shuffle -> Smart Shuffle -> off.
+    ToggleShuffle,
+    /// Advance repeat: off -> context -> track -> off.
+    CycleRepeat,
+    /// Jump to this position in the current track, in milliseconds.
+    SeekTo(u64),
 }
 
 const KEY_USERNAME: &str = "spotify.username";
@@ -68,14 +113,22 @@ const KEY_CREDENTIALS: &str = "spotify.stored_credentials";
 const KEY_DEVICE: &str = "spotify.observer_device_id";
 /// Spotify for Desktop ("keymaster"): enabled for device pairing, and the client the macOS
 /// identity of the fantasybot-red librespot fork logs in as.
-const PAIR_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
-const PAIR_SCOPES: &[&str] = &["streaming"];
-/// Left by the old OAuth backend; removed on start.
+pub(crate) const PAIR_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
+pub(crate) const PAIR_SCOPES: &[&str] = &["streaming"];
+/// The OAuth refresh token from pairing: a second way back in when the stored credential fails.
+const KEY_REFRESH: &str = "spotify.oauth_refresh_token";
+/// Left by an old backend; removed on start.
 const KEY_OLD_REFRESH: &str = "spotify.refresh_token";
+/// Reconnect delays after an unexpected disconnect; the last one repeats.
+const RECONNECT_DELAYS_S: &[u64] = &[2, 5, 10, 30, 60];
 
 thread_local! {
     /// Bumped by each sign-in or cancel, so a superseded pairing stops quietly.
     static PAIRING: Cell<u64> = const { Cell::new(0) };
+    /// Bumped by sign-in / sign-out, so a pending reconnect stops quietly.
+    static LOGIN_GEN: Cell<u64> = const { Cell::new(0) };
+    /// Unexpected disconnects in a row (reset once connected).
+    static RECONNECTS: Cell<usize> = const { Cell::new(0) };
     /// The running session's request channel (engine thread only).
     static SESSION: RefCell<Option<mpsc::UnboundedSender<session::Request>>> = const { RefCell::new(None) };
 }
@@ -100,6 +153,43 @@ fn stop_session() {
 fn forget_login() {
     Storage::remove_item(KEY_USERNAME);
     Storage::remove_item(KEY_CREDENTIALS);
+    Storage::remove_item(KEY_REFRESH);
+}
+
+fn saved_refresh() -> Option<String> {
+    Storage::get_item(KEY_REFRESH).filter(|t| !t.is_empty())
+}
+
+/// The best saved way to log in: the stored credential, else the refresh token. After a stored
+/// credential failure (`prefer_refresh`), the refresh token goes first.
+fn saved_login_method(prefer_refresh: bool) -> Option<session::Login> {
+    let stored = saved_login().map(|(username, auth_data)| session::Login::Stored { username, auth_data });
+    let refresh = saved_refresh().map(session::Login::Refresh);
+    if prefer_refresh { refresh.or(stored) } else { stored.or(refresh) }
+}
+
+/// Reconnects after an unexpected disconnect, with backoff, unless the user signed in/out since.
+fn schedule_reconnect(state: Signal<SpotifyState>, prefer_refresh: bool) {
+    let attempt = RECONNECTS.with(|r| {
+        let n = r.get();
+        r.set(n + 1);
+        n
+    });
+    let delay = RECONNECT_DELAYS_S[attempt.min(RECONNECT_DELAYS_S.len() - 1)];
+    let generation = LOGIN_GEN.with(Cell::get);
+    dlog::warn(format!("spotify: reconnecting in {delay}s (attempt {})", attempt + 1));
+    Owner::detached().run(move || {
+        spawn(async move {
+            timer(std::time::Duration::from_secs(delay)).await;
+            if LOGIN_GEN.with(Cell::get) != generation || SESSION.with(|s| s.borrow().is_some()) {
+                return;
+            }
+            match saved_login_method(prefer_refresh || attempt % 2 == 1) {
+                Some(login) => start_session_keeping(state, login, true),
+                None => state.set(SpotifyState::SignedOut),
+            }
+        });
+    });
 }
 
 fn saved_login() -> Option<(String, Vec<u8>)> {
@@ -114,8 +204,15 @@ fn saved_login() -> Option<(String, Vec<u8>)> {
 /// runtime's context, which press handlers do not have, so it is called from inside an engine
 /// task (tasks are polled in the runtime's context).
 fn start_session(state: Signal<SpotifyState>, login: session::Login) {
+    start_session_keeping(state, login, false);
+}
+
+/// `keep_screen`: a reconnect keeps showing the last playback instead of "Connecting".
+fn start_session_keeping(state: Signal<SpotifyState>, login: session::Login, keep_screen: bool) {
     stop_session();
-    state.set(SpotifyState::Connecting);
+    if !(keep_screen && matches!(state.get_untracked(), SpotifyState::Connected(_))) {
+        state.set(SpotifyState::Connecting);
+    }
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (request_tx, request_rx) = mpsc::unbounded_channel();
     SESSION.with(|s| *s.borrow_mut() = Some(request_tx.clone()));
@@ -138,10 +235,16 @@ fn start_session(state: Signal<SpotifyState>, login: session::Login) {
                     let _ = Storage::set_item(KEY_USERNAME, username);
                     let _ = Storage::set_item(KEY_CREDENTIALS, BASE64.encode(auth_data));
                 }
+                session::Event::Playlists(list) => playlists().set(list),
+                session::Event::RefreshToken(token) => {
+                    dlog::info("spotify: saving rotated refresh token");
+                    let _ = Storage::set_item(KEY_REFRESH, token);
+                }
                 session::Event::Playback(playback) => {
                     if !matches!(state.get_untracked(), SpotifyState::Connected(_)) {
                         dlog::info("spotify: connected");
                     }
+                    RECONNECTS.with(|r| r.set(0));
                     state.set(SpotifyState::Connected(playback));
                 }
                 session::Event::Error(message) => {
@@ -154,12 +257,21 @@ fn start_session(state: Signal<SpotifyState>, login: session::Login) {
                 session::Event::Ended { message, signed_out } => {
                     SESSION.with(|s| *s.borrow_mut() = None);
                     if signed_out {
-                        forget_login();
+                        // That way in is dead; keep the other one (stored credential vs refresh).
+                        Storage::remove_item(KEY_CREDENTIALS);
                     }
-                    state.set(match message {
-                        Some(m) => SpotifyState::Error(m),
-                        None => SpotifyState::SignedOut,
-                    });
+                    let Some(message) = message else {
+                        state.set(SpotifyState::SignedOut);
+                        break;
+                    };
+                    if saved_login_method(signed_out).is_some() {
+                        // Drops, kicks and expiries are retried quietly; the user never re-pairs
+                        // while a saved credential or refresh token still works.
+                        schedule_reconnect(state, signed_out);
+                    } else {
+                        forget_login();
+                        state.set(SpotifyState::Error(message));
+                    }
                     break;
                 }
             }
@@ -171,6 +283,7 @@ fn start_session(state: Signal<SpotifyState>, login: session::Login) {
 /// iPad shows it, and the user approves it at spotify.com/pair on a phone or computer while the
 /// app polls. No browser on the iPad and nothing listening on a port.
 fn sign_in(state: Signal<SpotifyState>) {
+    LOGIN_GEN.with(|g| g.set(g.get() + 1));
     dlog::info("sign-in: requesting a pairing code (device authorization)");
     stop_session();
     state.set(SpotifyState::Connecting);
@@ -218,7 +331,11 @@ fn sign_in(state: Signal<SpotifyState>) {
             }
             match token {
                 Ok(Ok(token)) => {
-                    dlog::info("sign-in: paired, access token received");
+                    dlog::info(format!("sign-in: paired, access token received (refresh token: {})", !token.refresh_token.is_empty()));
+                    if !token.refresh_token.is_empty() {
+                        let _ = Storage::set_item(KEY_REFRESH, token.refresh_token.clone());
+                    }
+                    RECONNECTS.with(|r| r.set(0));
                     start_session(state, session::Login::Token(token.access_token));
                 }
                 Ok(Err(e)) => {
@@ -241,10 +358,10 @@ fn sign_in(state: Signal<SpotifyState>) {
 /// Starts the backend once for the dashboard, restoring a saved login when one exists.
 pub fn start(state: Signal<SpotifyState>) {
     Storage::remove_item(KEY_OLD_REFRESH);
-    match saved_login() {
-        Some((username, auth_data)) => {
-            dlog::info(format!("spotify: restoring saved login for '{username}'"));
-            start_session(state, session::Login::Stored { username, auth_data });
+    match saved_login_method(false) {
+        Some(login) => {
+            dlog::info(format!("spotify: restoring saved login {login:?}"));
+            start_session(state, login);
         }
         None => state.set(SpotifyState::SignedOut),
     }
@@ -256,23 +373,65 @@ pub fn send(state: Signal<SpotifyState>, command: SpotifyCommand) {
         SpotifyCommand::SignIn => sign_in(state),
         SpotifyCommand::SignOut => {
             PAIRING.with(|p| p.set(p.get() + 1));
+            LOGIN_GEN.with(|g| g.set(g.get() + 1));
             dlog::info("spotify: sign out");
             stop_session();
             forget_login();
             state.set(SpotifyState::SignedOut);
         }
-        SpotifyCommand::PlayPause | SpotifyCommand::Next | SpotifyCommand::Previous => {
-            let remote = match (command, state.get_untracked()) {
-                (SpotifyCommand::Next, _) => connect::RemoteCommand::SkipNext,
-                (SpotifyCommand::Previous, _) => connect::RemoteCommand::SkipPrev,
-                (_, SpotifyState::Connected(p)) if p.is_playing => connect::RemoteCommand::Pause,
-                _ => connect::RemoteCommand::Resume,
+        _ => {
+            let playback = match state.get_untracked() {
+                SpotifyState::Connected(p) => p,
+                _ => Playback::default(),
             };
-            SESSION.with(|s| {
-                if let Some(tx) = s.borrow().as_ref() {
-                    let _ = tx.send(session::Request::Command(remote));
-                }
-            });
+            let remote = match command {
+                SpotifyCommand::Next => connect::RemoteCommand::SkipNext,
+                SpotifyCommand::Previous => connect::RemoteCommand::SkipPrev,
+                SpotifyCommand::PlayPause if playback.is_playing => connect::RemoteCommand::Pause,
+                SpotifyCommand::PlayPause => connect::RemoteCommand::Resume,
+                SpotifyCommand::ToggleShuffle => connect::RemoteCommand::SetShuffle(next_shuffle(&playback)),
+                SpotifyCommand::CycleRepeat => connect::RemoteCommand::SetRepeat(playback.repeat.next()),
+                SpotifyCommand::SeekTo(ms) => connect::RemoteCommand::SeekTo(ms),
+                SpotifyCommand::SignIn | SpotifyCommand::SignOut => return,
+            };
+            send_request(session::Request::Command(remote));
         }
     }
+}
+
+/// The shuffle state after a tap, like Spotify's own button.
+pub fn next_shuffle(playback: &Playback) -> connect::ShuffleMode {
+    use connect::ShuffleMode::*;
+    match (playback.shuffle, playback.smart_shuffle) {
+        (_, true) => Off,
+        (true, false) => Smart,
+        (false, false) => On,
+    }
+}
+
+fn send_request(request: session::Request) {
+    SESSION.with(|s| {
+        if let Some(tx) = s.borrow().as_ref() {
+            let _ = tx.send(request);
+        }
+    });
+}
+
+thread_local! {
+    /// The user's playlists for quick play (filled once connected; empty until then).
+    static PLAYLISTS: RefCell<Option<Signal<Vec<PlaylistSummary>>>> = const { RefCell::new(None) };
+}
+
+/// The user's playlists (Liked Songs first), loaded after connecting. Call from a component;
+/// the same signal is returned every time.
+pub fn playlists() -> Signal<Vec<PlaylistSummary>> {
+    PLAYLISTS.with(|p| {
+        *p.borrow_mut().get_or_insert_with(|| Owner::detached().run(|| signal(Vec::new())))
+    })
+}
+
+/// Starts playing `uri` (a playlist or Liked Songs) on the active device.
+pub fn play_context(uri: &str) {
+    dlog::info(format!("spotify: play context {uri}"));
+    send_request(session::Request::Command(connect::RemoteCommand::PlayContext(uri.to_owned())));
 }
