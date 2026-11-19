@@ -344,6 +344,7 @@ pub async fn run(
     // The last device that was active (commands go there while nothing is active).
     let mut last_active: Option<String> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut last_sent: Option<Playback> = None;
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let _ = events.send(Event::Playback(Playback::default()));
 
@@ -456,7 +457,13 @@ pub async fn run(
                 observed.extra = Some((uri, info));
             }
         }
-        let _ = events.send(Event::Playback(observed.playback(&device_id)));
+        // Only wake the UI when something it shows changed. While playing, progress moves every
+        // second; while paused nothing changes, so the card is not re-rendered (battery).
+        let pb = observed.playback(&device_id);
+        if last_sent.as_ref() != Some(&pb) {
+            let _ = events.send(Event::Playback(pb.clone()));
+            last_sent = Some(pb);
+        }
     }
 
     if registered {

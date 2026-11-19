@@ -15,8 +15,9 @@ fn native(registry: &mut Registry) {
 /// The native application root.
 #[component]
 pub fn App() -> impl IntoElement {
-    // Desk display: keep the screen on (iOS re-enables the idle timer in the background).
-    keep_awake::keep_screen_on();
-    set_interval(std::time::Duration::from_secs(60), keep_awake::keep_screen_on);
+    // Keep the screen on per the setting (default: only while charging). Re-checked so plugging
+    // in or unplugging takes effect within half a minute.
+    keep_awake::apply();
+    set_interval(std::time::Duration::from_secs(30), keep_awake::apply);
     dashboard::dashboard()
 }

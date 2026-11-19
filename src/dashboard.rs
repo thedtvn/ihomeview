@@ -253,10 +253,17 @@ fn dashboard_content(
     playlists: Signal<Vec<PlaylistSummary>>,
     timer_initially_open: bool,
 ) -> impl IntoElement {
-    // Clock: local time ticks every 500ms so seconds stay fresh without drift.
-    // The interval ends with this view, per https://nsh.dev/docs/reactivity.md#cleanup.
+    // Clock: one tick per second, aligned just after each second boundary (battery: half the
+    // wakeups of a 500ms poll, and the display only changes once a second anyway).
+    // The task ends with this view, per https://nsh.dev/docs/reactivity.md#cleanup.
     let now_local = signal(Local::now());
-    set_interval(Duration::from_millis(500), move || now_local.set(Local::now()));
+    spawn(async move {
+        loop {
+            let ms = Local::now().timestamp_subsec_millis() as u64;
+            timer(Duration::from_millis(1000 - ms.min(999) + 5)).await;
+            now_local.set(Local::now());
+        }
+    });
 
     crate::debug_log::install();
     let twelve_hour = signal(locale_settings().hour_cycle.twelve_hour());
@@ -743,6 +750,28 @@ fn settings_menu(
                     move || !twelve_hour.get(),
                     move || twelve_hour.update(|v| *v = !*v),
                 ))
+                .child(settings_action(
+                    "settings_keep_awake_row",
+                    "Keep screen on",
+                    || match crate::keep_awake::mode().get() {
+                        crate::keep_awake::KeepAwake::WhileCharging => "Only while plugged in (saves battery)".to_string(),
+                        crate::keep_awake::KeepAwake::Always => "Always, even on battery".to_string(),
+                        crate::keep_awake::KeepAwake::Off => "Normal auto-lock".to_string(),
+                    },
+                    Some((
+                        "settings_keep_awake",
+                        "Change",
+                        false,
+                        Box::new(crate::keep_awake::cycle_mode),
+                    )),
+                ))
+                .child(
+                    text(move || format!("Now: {}", crate::keep_awake::mode().get().label()))
+                        .test_id("settings_keep_awake_value")
+                        .px(px(14.0))
+                        .text_size(px(14.0))
+                        .text_color(rgba(GREEN)),
+                )
                 .child(settings_action(
                     "settings_debug_row",
                     "Debug log",
